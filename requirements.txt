@@ -1,0 +1,11 @@
+# Production dependencies only.
+# Development/test dependencies live in pyproject.toml under [project.optional-dependencies].
+
+streamlit>=1.32,<2.0
+supabase>=2.4,<3.0
+pydantic>=2.5,<3.0
+apscheduler>=3.10,<4.0
+plotly>=5.19,<6.0
+alembic>=1.13,<2.0
+psycopg[binary]>=3.1,<4.0
+python-dotenv>=1.0,<2.0
