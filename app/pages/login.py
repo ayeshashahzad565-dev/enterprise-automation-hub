@@ -13,12 +13,10 @@ authorization logic — only form rendering and delegation.
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
 import streamlit as st
 
 from app.auth.exceptions import AuthenticationError
-
 from app.pages import components, session
 
 __all__ = ["render", "logout", "handle_auth_callback", "render_password_reset"]
@@ -216,35 +214,12 @@ def render() -> None:
 
     container = session.get_container()
 
-    # TEMPORARY DEBUG: instrument exactly which object/method is about to be
-    # invoked, and where it was actually defined on disk. Logged via
-    # `logger.warning` (terminal, survives any st.rerun()) and `st.warning`
-    # (visible in-page, since nothing reruns between here and the call).
-    _gw = container.auth_gateway
-    _sign_in_func = _gw.sign_in.__func__
-    _expected_app_py = str(Path(__file__).resolve().parents[2] / "app.py")
-    _debug_report = (
-        f"type(container.auth_gateway)={type(_gw)!r} | "
-        f"id(container.auth_gateway)={id(_gw):#x} | "
-        f"auth_gateway.__class__.__module__={_gw.__class__.__module__!r} | "
-        f"auth_gateway.__class__.__qualname__={_gw.__class__.__qualname__!r} | "
-        f"sign_in defined at {_sign_in_func.__code__.co_filename}:{_sign_in_func.__code__.co_firstlineno} | "
-        f"id(sign_in function object)={id(_sign_in_func):#x} | "
-        f"sign_in file matches on-disk app.py={_sign_in_func.__code__.co_filename == _expected_app_py} | "
-        f"id(container)={id(container):#x}"
-    )
-    logger.warning("AUTH GATEWAY DEBUG: %s", _debug_report)
-    st.warning(_debug_report)
-
     with st.spinner("Signing in..."):
         try:
             result = container.auth_gateway.sign_in(email=email.strip(), password=password)
         except AuthenticationError as exc:
             logger.warning("Login failed for %s: %s", email, exc.message)
-            # TEMPORARY DEBUG: showing the actual error instead of a generic
-            # message; revert to session.push_flash("error", "Invalid email
-            # or password.") once resolved.
-            session.push_flash("error", str(exc))
+            session.push_flash("error", "Invalid email or password.")
             st.rerun()
             return
 

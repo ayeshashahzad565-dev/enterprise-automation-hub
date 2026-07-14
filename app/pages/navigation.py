@@ -16,10 +16,9 @@ from dataclasses import dataclass
 import streamlit as st
 
 from app.auth.authentication import AuthenticatedIdentity
-from app.auth.rbac import require_role
 from app.auth.exceptions import RoleNotPermittedError
+from app.auth.rbac import require_role
 from app.models.enums import UserRole
-
 from app.pages import session
 
 __all__ = ["NavItem", "NAV_ITEMS", "guard_role", "render_breadcrumbs", "render_sidebar", "render_app"]
@@ -172,8 +171,10 @@ def render_app() -> None:
         dashboard,
         login,
         profile,
-        requests as requests_page,
         workflows,
+    )
+    from app.pages import (
+        requests as requests_page,
     )
 
     if login.handle_auth_callback():

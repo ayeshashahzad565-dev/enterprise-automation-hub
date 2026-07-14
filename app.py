@@ -19,13 +19,11 @@ from __future__ import annotations
 import atexit
 import dataclasses
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
 import streamlit as st
-
-st.error("RUNNING THIS APP.PY")
 
 from app.analytics.analytics_engine import AnalyticsEngine
 from app.analytics.reporting import ReportingEngine
@@ -131,11 +129,7 @@ class SupabaseAuthGateway:
             # AuthenticationError, exactly as every other integration
             # boundary in this codebase translates a third-party failure.
             self._logger.warning("Supabase sign-in failed for %s: %s", email, exc)
-            # TEMPORARY DEBUG: surfacing the real Supabase error to diagnose a
-            # login failure; revert to AuthenticationError("Invalid email or
-            # password.") once resolved.
-            st.error("DEBUG: NEW AUTH PATH")
-            raise AuthenticationError(str(exc)) from exc
+            raise AuthenticationError("Invalid email or password.") from exc
 
         result = self._build_auth_result(response)
         self._logger.info(
@@ -274,7 +268,7 @@ class SupabaseAuthGateway:
             "exp": response.session.expires_at,
         }
         identity = AuthenticatedIdentity.from_claims(claims)
-        expires_at = datetime.fromtimestamp(response.session.expires_at, tz=timezone.utc)
+        expires_at = datetime.fromtimestamp(response.session.expires_at, tz=UTC)
 
         return session.AuthResult(
             identity=identity,
@@ -610,28 +604,9 @@ def _ensure_session_container(resources: _GlobalResources) -> None:
         resources: The process-wide global resource bundle.
     """
     if session.has_container():
-        # TEMPORARY DEBUG: confirm whether this rerun is reusing an
-        # already-stored per-session container (and thus its auth_gateway)
-        # rather than building a new one.
-        logger.warning(
-            "AUTH GATEWAY DEBUG: reusing existing session container; "
-            "id(auth_gateway)=%#x type=%r",
-            id(session.get_container().auth_gateway),
-            type(session.get_container().auth_gateway),
-        )
         return
     session_container = dataclasses.replace(
         resources.base_container, session_manager=SessionManager(InMemorySessionStore())
-    )
-    # TEMPORARY DEBUG: log the identity of the auth_gateway placed into a
-    # freshly built per-session container, for comparison against what
-    # login.py observes at click time.
-    logger.warning(
-        "AUTH GATEWAY DEBUG: building NEW session container; id(auth_gateway)=%#x "
-        "type=%r id(base_container.auth_gateway)=%#x",
-        id(session_container.auth_gateway),
-        type(session_container.auth_gateway),
-        id(resources.base_container.auth_gateway),
     )
     session.set_container(session_container)
     logger.debug("Initialized a new per-session AppContainer.")
