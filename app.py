@@ -20,9 +20,12 @@ import atexit
 import dataclasses
 import logging
 from datetime import datetime, timezone
+from typing import Any
 from uuid import UUID
 
 import streamlit as st
+
+st.error("RUNNING THIS APP.PY")
 
 from app.analytics.analytics_engine import AnalyticsEngine
 from app.analytics.reporting import ReportingEngine
@@ -128,10 +131,131 @@ class SupabaseAuthGateway:
             # AuthenticationError, exactly as every other integration
             # boundary in this codebase translates a third-party failure.
             self._logger.warning("Supabase sign-in failed for %s: %s", email, exc)
-            raise AuthenticationError("Invalid email or password.") from exc
+            # TEMPORARY DEBUG: surfacing the real Supabase error to diagnose a
+            # login failure; revert to AuthenticationError("Invalid email or
+            # password.") once resolved.
+            st.error("DEBUG: NEW AUTH PATH")
+            raise AuthenticationError(str(exc)) from exc
 
+        result = self._build_auth_result(response)
+        self._logger.info(
+            "User %s signed in successfully.",
+            result.identity.user_id,
+            extra={"user_id": str(result.identity.user_id)},
+        )
+        return result
+
+    def exchange_code_for_session(self, *, code: str) -> session.AuthResult:
+        """Exchange a Supabase PKCE auth callback code for a real session.
+
+        Handles the signup-confirmation, invite, and recovery email links
+        Supabase redirects back to this application with a ``?code=...``
+        query parameter (API-ADD/ADD auth callback handling).
+
+        Args:
+            code: The ``code`` value from the callback URL.
+
+        Returns:
+            The resulting ``session.AuthResult``.
+
+        Raises:
+            AuthenticationError: If the code is invalid, expired, or has
+                already been used.
+        """
+        client = SupabaseClientFactory.create_anon_client(self._supabase_settings)
+        try:
+            response = client.auth.exchange_code_for_session({"auth_code": code})
+        except Exception as exc:  # noqa: BLE001 - translated below
+            self._logger.warning("Supabase auth-code exchange failed: %s", exc)
+            raise AuthenticationError(
+                "This confirmation or recovery link is invalid or has expired."
+            ) from exc
+
+        result = self._build_auth_result(response)
+        self._logger.info(
+            "Auth callback code exchanged successfully for user %s.",
+            result.identity.user_id,
+            extra={"user_id": str(result.identity.user_id)},
+        )
+        return result
+
+    def restore_session(self, *, access_token: str, refresh_token: str) -> session.AuthResult:
+        """Restore a session directly from a pair of callback tokens.
+
+        Args:
+            access_token: The access token from the callback URL.
+            refresh_token: The refresh token from the callback URL.
+
+        Returns:
+            The resulting ``session.AuthResult``.
+
+        Raises:
+            AuthenticationError: If the tokens are invalid or expired.
+        """
+        client = SupabaseClientFactory.create_anon_client(self._supabase_settings)
+        try:
+            response = client.auth.set_session(access_token, refresh_token)
+        except Exception as exc:  # noqa: BLE001 - translated below
+            self._logger.warning("Supabase session restore failed: %s", exc)
+            raise AuthenticationError(
+                "Unable to restore your session from the supplied tokens."
+            ) from exc
+
+        return self._build_auth_result(response)
+
+    def update_password(
+        self, *, access_token: str, refresh_token: str, new_password: str
+    ) -> None:
+        """Set a new password for the user identified by a session's tokens.
+
+        Hydrates a fresh anon client with the given session (via
+        ``set_session``) before calling Supabase Auth's
+        ``update_user({"password": new_password})``, since password
+        update requires an authenticated session context. A fresh client
+        is still used per call, consistent with this class's isolation
+        rationale (see class docstring): no client here is ever shared
+        or reused across calls.
+
+        Args:
+            access_token: The access token of the session to act as.
+            refresh_token: The refresh token of the session to act as.
+            new_password: The new password to set.
+
+        Raises:
+            AuthenticationError: If Supabase rejects the update.
+        """
+        client = SupabaseClientFactory.create_anon_client(self._supabase_settings)
+        try:
+            client.auth.set_session(access_token, refresh_token)
+            client.auth.update_user({"password": new_password})
+        except Exception as exc:  # noqa: BLE001 - translated below
+            self._logger.warning("Password update failed: %s", exc)
+            raise AuthenticationError("Unable to update your password.") from exc
+
+    def _build_auth_result(self, response: Any) -> session.AuthResult:
+        """Build a ``session.AuthResult`` from a Supabase Auth response.
+
+        Shared by every method above that obtains a session from Supabase
+        (sign-in, auth-code exchange, and token-based restore), so the
+        "resolve the caller's RBAC role from ``profiles``, never trust a
+        raw token claim" rule (per the ADD) is applied in exactly one
+        place.
+
+        Args:
+            response: The ``AuthResponse`` (or equivalent) Supabase's
+                GoTrue client returned, carrying ``.session`` and
+                ``.user``.
+
+        Returns:
+            The resulting ``session.AuthResult``.
+
+        Raises:
+            AuthenticationError: If ``response`` carries no valid
+                session/user, or no ``profiles`` row exists for the
+                authenticated user.
+        """
         if response.session is None or response.user is None:
-            raise AuthenticationError("Sign-in did not return a valid session.")
+            raise AuthenticationError("Supabase did not return a valid session.")
 
         try:
             profile = self._profile_repo.get_by_id(UUID(response.user.id))
@@ -152,7 +276,6 @@ class SupabaseAuthGateway:
         identity = AuthenticatedIdentity.from_claims(claims)
         expires_at = datetime.fromtimestamp(response.session.expires_at, tz=timezone.utc)
 
-        self._logger.info("User %s signed in successfully.", profile.id, extra={"user_id": str(profile.id)})
         return session.AuthResult(
             identity=identity,
             access_token=response.session.access_token,
@@ -487,9 +610,28 @@ def _ensure_session_container(resources: _GlobalResources) -> None:
         resources: The process-wide global resource bundle.
     """
     if session.has_container():
+        # TEMPORARY DEBUG: confirm whether this rerun is reusing an
+        # already-stored per-session container (and thus its auth_gateway)
+        # rather than building a new one.
+        logger.warning(
+            "AUTH GATEWAY DEBUG: reusing existing session container; "
+            "id(auth_gateway)=%#x type=%r",
+            id(session.get_container().auth_gateway),
+            type(session.get_container().auth_gateway),
+        )
         return
     session_container = dataclasses.replace(
         resources.base_container, session_manager=SessionManager(InMemorySessionStore())
+    )
+    # TEMPORARY DEBUG: log the identity of the auth_gateway placed into a
+    # freshly built per-session container, for comparison against what
+    # login.py observes at click time.
+    logger.warning(
+        "AUTH GATEWAY DEBUG: building NEW session container; id(auth_gateway)=%#x "
+        "type=%r id(base_container.auth_gateway)=%#x",
+        id(session_container.auth_gateway),
+        type(session_container.auth_gateway),
+        id(resources.base_container.auth_gateway),
     )
     session.set_container(session_container)
     logger.debug("Initialized a new per-session AppContainer.")

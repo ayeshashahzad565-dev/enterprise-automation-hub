@@ -52,6 +52,9 @@ __all__ = [
     "set_identity",
     "clear_identity",
     "is_authenticated",
+    "set_recovery_pending",
+    "is_recovery_pending",
+    "clear_recovery_pending",
     "get_active_page",
     "set_active_page",
     "get_filters",
@@ -85,6 +88,7 @@ _KEY_PAGINATION = "eah_pagination"
 _KEY_FLASH_MESSAGES = "eah_flash_messages"
 _KEY_CACHED_SELECTIONS = "eah_cached_selections"
 _KEY_PENDING_CONFIRMATIONS = "eah_pending_confirmations"
+_KEY_RECOVERY_PENDING = "eah_recovery_pending"
 
 _DEFAULT_PAGE_NUMBER = 1
 _DEFAULT_PAGE_SIZE = 20
@@ -169,6 +173,60 @@ class AuthGateway(Protocol):
 
         Args:
             email: The address to send a reset link to.
+        """
+        ...
+
+    def exchange_code_for_session(self, *, code: str) -> AuthResult:
+        """Exchange a Supabase PKCE auth callback code for a real session.
+
+        Used for the signup-confirmation, invite, and recovery email
+        links Supabase redirects back to this application with a
+        ``?code=...`` query parameter.
+
+        Args:
+            code: The ``code`` value from the callback URL.
+
+        Returns:
+            The resulting ``AuthResult``.
+
+        Raises:
+            app.auth.exceptions.AuthenticationError: If the code is
+                invalid, expired, or already used.
+        """
+        ...
+
+    def restore_session(self, *, access_token: str, refresh_token: str) -> AuthResult:
+        """Restore a session directly from a callback's access/refresh tokens.
+
+        Args:
+            access_token: The access token from the callback URL.
+            refresh_token: The refresh token from the callback URL.
+
+        Returns:
+            The resulting ``AuthResult``.
+
+        Raises:
+            app.auth.exceptions.AuthenticationError: If the tokens are
+                invalid or expired.
+        """
+        ...
+
+    def update_password(
+        self, *, access_token: str, refresh_token: str, new_password: str
+    ) -> None:
+        """Set a new password for the user identified by a session's tokens.
+
+        Used to complete the recovery/invite flow, via Supabase Auth's
+        ``client.auth.update_user({"password": new_password})``.
+
+        Args:
+            access_token: The access token of the session to act as.
+            refresh_token: The refresh token of the session to act as.
+            new_password: The new password to set.
+
+        Raises:
+            app.auth.exceptions.AuthenticationError: If Supabase rejects
+                the update.
         """
         ...
 
@@ -296,6 +354,27 @@ def is_authenticated() -> bool:
     """
     identity = get_identity()
     return identity is not None and not identity.is_expired
+
+
+def set_recovery_pending() -> None:
+    """Mark that the current session must set a new password before
+    proceeding, per a recovery or invite callback (see ``login.handle_auth_callback``).
+    """
+    st.session_state[_KEY_RECOVERY_PENDING] = True
+
+
+def is_recovery_pending() -> bool:
+    """Return whether the current session must set a new password before
+    accessing the rest of the application.
+    """
+    return bool(st.session_state.get(_KEY_RECOVERY_PENDING, False))
+
+
+def clear_recovery_pending() -> None:
+    """Clear the pending-password-recovery flag, once a new password has
+    been set.
+    """
+    st.session_state.pop(_KEY_RECOVERY_PENDING, None)
 
 
 def get_active_page() -> str | None:

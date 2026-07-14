@@ -28,6 +28,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from typing import Mapping
+from pathlib import Path
+from dotenv import load_dotenv
 
 from app.config import constants
 from app.config.environment import Environment, detect_environment
@@ -37,6 +39,8 @@ from app.config.exceptions import (
 )
 from app.database.client import SupabaseConnectionSettings
 
+# Load environment variables from a .env file if it exists
+load_dotenv()
 
 @dataclass(frozen=True, slots=True)
 class SmtpSettings:

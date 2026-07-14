@@ -9,9 +9,11 @@ description = "Enterprise Automation Hub (EAH) — a modular monolithic applicat
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
+
 authors = [
     { name = "Enterprise Automation Hub Engineering" }
 ]
+
 classifiers = [
     "Programming Language :: Python :: 3.11",
     "License :: OSI Approved :: MIT License",
@@ -40,6 +42,9 @@ dev = [
     "mypy>=1.9",
 ]
 
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
 [tool.black]
 line-length = 100
 target-version = ["py311"]
@@ -59,7 +64,7 @@ exclude = '''
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-src = ["src", "tests"]
+src = ["app", "tests"]
 exclude = [
     ".venv",
     ".git",
@@ -75,14 +80,11 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 ignore = ["E501"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["src"]
+known-first-party = ["app"]
 
 [tool.coverage.run]
-source = ["src"]
+source = ["app"]
 branch = true
-omit = [
-    "src/ui/*",
-]
 
 [tool.coverage.report]
 show_missing = true
@@ -95,6 +97,6 @@ exclude_lines = [
 
 [tool.mypy]
 python_version = "3.11"
-files = ["src"]
+files = ["app"]
 ignore_missing_imports = true
 disallow_untyped_defs = false

@@ -176,8 +176,15 @@ def render_app() -> None:
         workflows,
     )
 
+    if login.handle_auth_callback():
+        return
+
     if not session.is_authenticated():
         login.render()
+        return
+
+    if session.is_recovery_pending():
+        login.render_password_reset()
         return
 
     identity = session.get_identity()

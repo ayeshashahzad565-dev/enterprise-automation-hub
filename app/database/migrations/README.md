@@ -27,12 +27,22 @@ This directory holds:
   schema change, forming the project's complete, append-only schema
   history.
 
-These files are intentionally not included in this initial delivery of
-`app/database`, since this package's scope for this implementation pass
-is limited to the client, exceptions, and repository modules. They are
-generated via Alembic's own tooling (`alembic init`, `alembic revision
---autogenerate`) once the corresponding Domain Layer models exist to
-generate an initial revision against.
+This directory now holds the initial revision history:
+
+- `0001_initial_schema` — every native enum type, table, index, and
+  constraint (`profiles`, `workflow_definitions`, `requests`,
+  `workflow_stages`, `notifications`, `audit_logs`), plus the
+  `updated_at`-maintenance trigger.
+- `0002_auth_profile_trigger` — the `on_auth_user_created` trigger that
+  auto-provisions a `profiles` row for each new `auth.users` row.
+- `0003_row_level_security` — grants and RLS policies for every table.
+
+Since no SQLAlchemy ORM models exist anywhere in this project (the
+fixed technology stack is Supabase/PostgREST, not an ORM), every
+revision here is hand-authored raw SQL via `op.execute(...)`, not
+generated with `alembic revision --autogenerate` — `env.py` sets
+`target_metadata = None` accordingly. Future revisions should be created
+with a plain `alembic revision -m "..."` and written the same way.
 
 ## Migration Principles (per DSD Section 15 and DG Section 11)
 
