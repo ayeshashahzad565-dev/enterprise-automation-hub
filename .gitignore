@@ -6,14 +6,20 @@ __pycache__/
 *$py.class
 *.so
 .Python
-build/
+# Anchored to repo root (leading slash): these are Python packaging
+# build-artifact directory names, not meant to match same-named
+# directories anywhere in the tree — an unanchored `lib/` here
+# previously matched frontend/src/lib/ and three feature-level lib/
+# dirs, silently excluding all of them (17 real source files) from
+# version control.
+/build/
 develop-eggs/
-dist/
+/dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+/lib/
+/lib64/
 parts/
 sdist/
 var/
@@ -93,8 +99,8 @@ supabase/.branches/
 # ==============================================================================
 *.egg-info/
 *.egg
-build/
-dist/
+/build/
+/dist/
 
 # ==============================================================================
 # OS Files
