@@ -37,6 +37,9 @@ BEARER_AUTH_SCHEME: Final[str] = "Bearer"
 #: upload. Matches API-ADD Section 23's file-handling discipline; kept as
 #: a fixed security constant rather than an environment variable, since
 #: this is a security boundary, not environment-specific tuning.
+#: ``application/zip`` was added alongside this application's attachment
+#: feature build-out, per that feature's explicit requirement to support
+#: ZIP uploads — every other entry here predates that work.
 ALLOWED_ATTACHMENT_CONTENT_TYPES: Final[frozenset[str]] = frozenset(
     {
         "application/pdf",
@@ -49,6 +52,7 @@ ALLOWED_ATTACHMENT_CONTENT_TYPES: Final[frozenset[str]] = frozenset(
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "application/vnd.ms-excel",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/zip",
     }
 )
 
@@ -56,6 +60,20 @@ ALLOWED_ATTACHMENT_CONTENT_TYPES: Final[frozenset[str]] = frozenset(
 #: DSD Section 4.1 check constraint that ``size_bytes > 0`` combined with
 #: the API-ADD's documented upper bound for a single upload.
 MAX_ATTACHMENT_SIZE_BYTES: Final[int] = 25 * 1024 * 1024
+
+#: The single Supabase Storage bucket every attachment is written to and
+#: read from, per the Deployment Guide's "a single bucket for
+#: attachments" provisioning note. Kept as a fixed constant, not an
+#: environment variable, for the same reason as the constants above: this
+#: names a fixed architectural boundary, not per-environment tuning — a
+#: different deployment environment already gets an entirely separate
+#: Supabase project (and therefore an entirely separate bucket namespace)
+#: via its own ``SUPABASE_URL``/keys, so the bucket's own name never needs
+#: to vary. This bucket must be created (and its access policy configured
+#: to mirror the ``attachments`` table's RLS policies) as an operator
+#: step before this application's attachment features are used, exactly
+#: like a database migration — see ``docs/deployment.md``.
+ATTACHMENTS_STORAGE_BUCKET: Final[str] = "attachments"
 
 # ---------------------------------------------------------------------------
 # Secret handling

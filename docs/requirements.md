@@ -6,6 +6,15 @@
 **Author:** Senior Software Architect
 **Status:** Version 1.2 Approved
 
+> **Superseded note:** This SRS was written against EAH's original baseline
+> design (a Streamlit UI with Plotly charts, per the ADD of the time). The
+> Presentation Layer has since been fully rebuilt as a FastAPI REST API
+> (`app/`) with a separate Next.js 15 / React 19 frontend (`frontend/`).
+> Functional requirements below remain the intended behavior; any mention of
+> Streamlit, `st.session_state`, or Plotly describes the original
+> implementation technology, not the shipped one. See `docs/deployment.md`
+> and `PROJECT_SUMMARY.md` for the current stack.
+
 ---
 
 ### 1. Executive Summary

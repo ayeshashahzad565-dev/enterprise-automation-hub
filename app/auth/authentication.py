@@ -30,9 +30,10 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Mapping
+from typing import Any
 from uuid import UUID
 
 from app.auth.exceptions import (
@@ -41,7 +42,7 @@ from app.auth.exceptions import (
     MissingCredentialsError,
     TokenExpiredError,
 )
-from app.config.security import AUTHORIZATION_HEADER_NAME, BEARER_AUTH_SCHEME
+from app.config.security import BEARER_AUTH_SCHEME
 from app.models.enums import UserRole
 from app.utils.datetime_utils import ensure_timezone_aware, is_past, utc_now
 
@@ -73,6 +74,14 @@ class AuthenticatedIdentity:
             ``from_claims`` is expected to already carry the
             database-resolved role under a ``role`` key, not a raw,
             token-native claim.
+        company_id: The company (tenant) this identity belongs to,
+            resolved from ``profiles.company_id`` by the same claims
+            source as ``role`` — never trusted from a raw token claim.
+            Every authorized query this identity drives is scoped to
+            this company.
+        is_platform_admin: Whether this identity carries platform-level
+            administrative capability, orthogonal to ``role`` — see
+            ``app.models.user.Profile.is_platform_admin``.
         expires_at: The token's expiry timestamp, if present in the
             claims (standard JWT ``exp`` claim, as a Unix timestamp).
         raw_claims: The complete, original claims mapping, preserved for
@@ -83,26 +92,31 @@ class AuthenticatedIdentity:
     user_id: UUID
     email: str | None
     role: UserRole
+    company_id: UUID
+    is_platform_admin: bool
     expires_at: datetime | None
     raw_claims: Mapping[str, Any]
 
     @classmethod
-    def from_claims(cls, claims: Mapping[str, Any]) -> "AuthenticatedIdentity":
+    def from_claims(cls, claims: Mapping[str, Any]) -> AuthenticatedIdentity:
         """Construct an ``AuthenticatedIdentity`` from an already-verified
         claims mapping.
 
         Args:
             claims: A mapping containing at minimum ``sub`` (the user's
-                id) and ``role`` (the user's RBAC role, already resolved
+                id), ``role`` (the user's RBAC role, already resolved
                 from ``profiles.role`` by the caller, per API-ADD Section
-                3.4). May also contain ``email`` and ``exp``.
+                3.4), and ``company_id`` (already resolved from
+                ``profiles.company_id`` the same way). May also contain
+                ``email``, ``exp``, and ``is_platform_admin``.
 
         Returns:
             A new ``AuthenticatedIdentity``.
 
         Raises:
-            InvalidTokenError: If ``sub`` or ``role`` is missing, or
-                ``role`` does not match a recognized ``UserRole`` value.
+            InvalidTokenError: If ``sub``, ``role``, or ``company_id`` is
+                missing or invalid, or ``role`` does not match a
+                recognized ``UserRole`` value.
             TokenExpiredError: If ``exp`` is present and indicates the
                 token has already expired.
         """
@@ -112,7 +126,9 @@ class AuthenticatedIdentity:
         try:
             user_id = UUID(str(subject))
         except (ValueError, AttributeError, TypeError) as exc:
-            raise InvalidTokenError(f"Claims' 'sub' field is not a valid UUID: {subject!r}") from exc
+            raise InvalidTokenError(
+                f"Claims' 'sub' field is not a valid UUID: {subject!r}"
+            ) from exc
 
         raw_role = claims.get("role")
         if not raw_role:
@@ -120,7 +136,19 @@ class AuthenticatedIdentity:
         try:
             role = UserRole(raw_role)
         except ValueError as exc:
-            raise InvalidTokenError(f"Claims' 'role' field is not recognized: {raw_role!r}") from exc
+            raise InvalidTokenError(
+                f"Claims' 'role' field is not recognized: {raw_role!r}"
+            ) from exc
+
+        raw_company_id = claims.get("company_id")
+        if not raw_company_id:
+            raise InvalidTokenError("Claims are missing a required 'company_id' field.")
+        try:
+            company_id = UUID(str(raw_company_id))
+        except (ValueError, AttributeError, TypeError) as exc:
+            raise InvalidTokenError(
+                f"Claims' 'company_id' field is not a valid UUID: {raw_company_id!r}"
+            ) from exc
 
         expires_at: datetime | None = None
         raw_exp = claims.get("exp")
@@ -133,6 +161,8 @@ class AuthenticatedIdentity:
             user_id=user_id,
             email=claims.get("email"),
             role=role,
+            company_id=company_id,
+            is_platform_admin=bool(claims.get("is_platform_admin", False)),
             expires_at=expires_at,
             raw_claims=claims,
         )

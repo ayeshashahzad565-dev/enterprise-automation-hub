@@ -6,6 +6,17 @@
 **Author:** Principal Software Architect
 **Base Path:** `/api/v1`
 
+> **Superseded note:** This document originally specified a *conceptual*
+> REST contract sitting on top of direct in-process calls from a Streamlit
+> Presentation Layer — at the time, `/api/v1` was not a real HTTP server.
+> It now **is**: `app/api/` is a live FastAPI application implementing this
+> base path, and the Presentation Layer is a separate Next.js 15 / React 19
+> frontend (`frontend/`) that consumes it over real HTTP, not in-process
+> Python calls. The resource/verb/status-code contract described below is
+> the one actually implemented; only its framing as calls "Streamlit makes
+> in-process" is historical. See `docs/deployment.md` for the current
+> architecture.
+
 ---
 
 ## Table of Contents
@@ -373,6 +384,7 @@ This section defines the canonical JSON shape of every resource returned by this
 | `read_at` | datetime | Yes | |
 | `email_sent` | boolean | No | |
 | `email_sent_at` | datetime | Yes | |
+| `archived_at` | datetime | Yes | Section 19.8.4/19.8.5 |
 | `created_at` | datetime | No | |
 
 ### 10.7 `WorkflowDefinition`
@@ -491,6 +503,8 @@ Pagination is mandatory on every list endpoint. Given the DSD's expected scale (
 | `department` | Requests | `?department=finance` |
 | `assigned_to` | Workflow Stages | `?assigned_to=me` |
 | `is_read` | Notifications | `?is_read=false` |
+| `notification_type` | Notifications | `?notification_type=assignment` |
+| `is_archived` | Notifications | `?is_archived=true` (defaults to `false`, the active view) |
 | `created_after` / `created_before` | Requests, Audit Logs | `?created_after=2026-06-01T00:00:00Z` |
 | `search` | Requests | `?search=laptop` |
 | `sort` | Most list endpoints | `?sort=-created_at` (Section 3.10) |
@@ -526,7 +540,7 @@ Idempotency and optimistic locking (DSD Section 3.9) are complementary, not redu
 
 ## 15. Rate Limiting
 
-Rate limits are enforced per authenticated user (keyed on `profiles.id`), not per IP address, since this is an internally-authenticated system per the ADD's deployment model.
+Rate limits are enforced per authenticated user (keyed on `profiles.id`), not per IP address, since this is an internally-authenticated system per the ADD's deployment model. **The one exception** (added in Milestone 9's hardening pass): `GET /api/v1/invitations/validate` and `POST /api/v1/invitations/accept` are this API's only unauthenticated endpoints — there is no `profiles.id` to key on, since the caller has no account yet — so those two routes alone are rate-limited per source IP address instead. Every other endpoint in this document, including every admin endpoint, remains user-keyed exactly as described above; this carve-out does not apply to them.
 
 | Endpoint Category | Limit | Window |
 |---|---|---|
@@ -535,8 +549,11 @@ Rate limits are enforced per authenticated user (keyed on `profiles.id`), not pe
 | `POST /api/v1/requests/{id}/attachments` (file upload) | 20 requests | per minute |
 | `POST /api/v1/auth/login` | 10 requests | per 5 minutes (per email address, to slow credential-guessing attempts) |
 | `GET /api/v1/notifications/unread-count` (polling endpoint) | 30 requests | per minute |
+| `GET /api/v1/invitations/validate` + `POST /api/v1/invitations/accept` (public, unauthenticated — shared budget across both) | 20 requests | per 5 minutes, **per caller IP address** |
 
 A caller exceeding a limit receives `429 RATE_LIMITED` (Section 11.3) with a `Retry-After` header indicating the number of seconds until the window resets. These figures are illustrative defaults sized for the SRS's stated scale (50 concurrent users) and are configuration, not code — they can be tuned per deployment without changing any endpoint's contract.
+
+As of Milestone 13, every row above except `POST /api/v1/auth/login` has an actual server-side enforcement point (`app.api.rate_limiting`, an in-process, per-instance limiter — see that module's own docstring for its documented multi-instance-deployment limitation): `enforce_rate_limit` is attached to every authenticated router in `app.api.main` and is method-aware, splitting `GET`/`HEAD`/`OPTIONS` traffic into the read budget and everything else into the write budget; `enforce_upload_rate_limit` and `enforce_notification_poll_rate_limit` layer the two narrower, route-specific budgets on top of it for attachment upload/replace and the unread-count poll endpoint respectively; `enforce_invitation_rate_limit` (Milestone 9) remains the sole per-IP exception, for the two unauthenticated invitation routes. The `POST /api/v1/auth/login` row is not enforced because no such endpoint exists in this API — login is performed directly against Supabase Auth from the frontend (Section 5.2) — and is retained here only as a documented figure for a future first-party login endpoint, should one be added.
 
 ---
 
@@ -639,6 +656,9 @@ The diagram below traces a single request through the API surface, from submissi
 | DELETE | `/api/v1/attachments/{id}` | Remove attachment (soft delete) | employee (uploader) / admin |
 | GET | `/api/v1/notifications` | List my notifications | employee |
 | PATCH | `/api/v1/notifications/{id}/read` | Mark read | employee |
+| PATCH | `/api/v1/notifications/read-all` | Mark all read | employee |
+| PATCH | `/api/v1/notifications/{id}/archive` | Archive | employee (recipient only) |
+| PATCH | `/api/v1/notifications/{id}/unarchive` | Restore an archived notification | employee (recipient only) |
 | GET | `/api/v1/notifications/unread-count` | Unread count | employee |
 | POST | `/api/v1/workflow-definitions` | Create definition | admin |
 | PATCH | `/api/v1/workflow-definitions/{id}` | Edit inactive definition | admin |
@@ -646,6 +666,7 @@ The diagram below traces a single request through the API surface, from submissi
 | GET | `/api/v1/workflow-definitions` | List definitions | employee (active only) / admin (all) |
 | GET | `/api/v1/requests/{id}/audit-log` | Request audit trail | employee |
 | GET | `/api/v1/audit-logs` | Org-wide audit search | admin |
+| GET | `/api/v1/search` | Global fuzzy search across every entity | employee (scoped per entity type; `user` results admin only) |
 
 ---
 
@@ -884,7 +905,7 @@ See Section 23 for the full file-handling discussion (sanitization, duplicates, 
 #### 19.8.1 `GET /api/v1/notifications`
 
 **Purpose:** List the caller's own notifications.
-**Query Parameters:** `is_read`, `page`, `page_size`, `sort` (default `-created_at`).
+**Query Parameters:** `is_read`, `notification_type`, `is_archived` (default `false`), `page`, `page_size`, `sort` (default `-created_at`).
 **Status Codes:** `200`; `401`.
 **Related Components:** `NotificationService`.
 
@@ -897,9 +918,31 @@ See Section 23 for the full file-handling discussion (sanitization, duplicates, 
 
 #### 19.8.3 `GET /api/v1/notifications/unread-count`
 
-**Purpose:** Return an unread count for a lightweight UI badge.
+**Purpose:** Return an unread count for a lightweight UI badge. Excludes archived notifications (Section 19.8.4/19.8.5) — an archived notification never contributes to this count.
 **Example Response (200):** `{ "data": { "unread_count": 4 }, "meta": { ... } }`
 **Status Codes:** `200`; `401`.
+**Related Components:** `NotificationService`.
+
+#### 19.8.4 `PATCH /api/v1/notifications/{id}/archive`
+
+**Purpose:** Archive a notification, removing it from the recipient's default (active) view without deleting it.
+**Authorization:** Recipient only — not even an administrator may archive another user's notification.
+**Status Codes:** `200` (idempotent — archiving an already-archived notification is a no-op that still returns `200`); `403`; `404`.
+**Related Components:** `NotificationService`.
+
+#### 19.8.5 `PATCH /api/v1/notifications/{id}/unarchive`
+
+**Purpose:** Restore a previously archived notification to the recipient's default view.
+**Authorization:** Recipient only.
+**Status Codes:** `200` (idempotent); `403`; `404`.
+**Related Components:** `NotificationService`.
+
+#### 19.8.6 `PATCH /api/v1/notifications/read-all`
+
+**Purpose:** Mark every one of the caller's currently unread notifications as read in a single call.
+**Authorization:** Caller, for their own notifications only.
+**Example Response (200):** `{ "data": { "updated_count": 3 }, "meta": { ... } }`
+**Status Codes:** `200` (idempotent — returns `updated_count: 0` if nothing was unread); `401`.
 **Related Components:** `NotificationService`.
 
 ### 19.9 Workflow Definitions
@@ -951,6 +994,19 @@ See Section 23 for the full file-handling discussion (sanitization, duplicates, 
 **Query Parameters:** `actor_id`, `action`, `created_after`, `created_before`, `page`, `page_size`.
 **Status Codes:** `200`; `403`.
 **Related Components:** `AuditService`. No `PATCH`/`DELETE` route exists for this resource anywhere in this API, matching the DSD's `INSERT`/`SELECT`-only database grants.
+
+### 19.11 Global Search
+
+#### 19.11.1 `GET /api/v1/search`
+
+**Purpose:** Fuzzy, filterable search across requests, the caller's own pending approvals, workflow definitions, comments, audit entries, and (administrator only) user profiles — one ranked, combined result list, not a separate resource per entity type.
+**Authorization:** Every authenticated role; each entity type is scoped to exactly what that caller could already see through its own dedicated endpoint (Sections 19.3, 19.5, 19.6, 19.9, 19.10) — this endpoint grants no visibility beyond that. `entity_type=user` results are silently omitted for a non-administrator rather than rejected with `403`, so a shared filter selection degrades gracefully across roles instead of erroring.
+**Query Parameters:** `q` (required, the search term), `entity_type` (repeatable — `request`, `approval`, `workflow`, `user`, `comment`, `audit_entry`; defaults to every type the caller's role can ever match).
+**Example Response (200):** `{ "data": [ { "entity_type": "request", "id": "...", "title": "...", "subtitle": "...", "snippet": "...with the **match** highlighted...", "score": 0.91, "created_at": "...", "request_id": "..." }, ... ], "meta": { ... } }`
+**Status Codes:** `200`; `400 VALIDATION_ERROR` (empty `q`); `401`.
+**Related Components:** `GlobalSearchService`, composing `RequestService`, `ApprovalService`, and `WorkflowDefinitionService` directly (each already scoped correctly per role), plus `CommentRepository`/`AuditRepository`/`ProfileRepository` directly where no dedicated service method searches across more than one request or user at a time.
+**Matching:** A case-insensitive substring (`ILIKE`) query narrows each entity type at the database — the same mechanism `search_requests` (Section 19.3.6) already uses — except `approval`, whose candidates are the caller's own bounded pending-approval queue, scored entirely in application code (no database prefilter exists for that entity type). Every result is additionally scored for typo tolerance via a dependency-free string-similarity function, not a database full-text-search or trigram index — no such index is provisioned in this schema (Section 3, Database Schema Design Document). This is real typo tolerance on an already-authorized, bounded candidate set, not a true fuzzy search across an entire table.
+**Not paginated.** Each entity type is capped at a fixed result count per request; this endpoint is a quick, cross-entity lookup, not an exhaustive browse — a caller wanting every match within one entity type uses that entity's own paginated endpoint instead.
 
 ---
 
@@ -1291,7 +1347,7 @@ None of these evolutions require restructuring the Application, Domain, or Repos
 
 **Optimistic Locking** — A concurrency-control strategy using a `version` column to detect, rather than prevent, conflicting concurrent updates (DSD Section 3.9).
 
-**Presentation Layer** — The Streamlit-based UI code in `src/ui`, the sole current consumer of the contract specified in this document.
+**Presentation Layer** — Originally the Streamlit-based UI code in `src/ui`; now the Next.js/React frontend in `frontend/`, the sole current consumer of the contract specified in this document.
 
 **Repository Layer** — The `src/repositories` code that translates between domain models and Supabase's data representation; the only layer that issues database queries.
 

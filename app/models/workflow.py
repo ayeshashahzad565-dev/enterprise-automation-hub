@@ -20,7 +20,6 @@ from app.models.base import (
     IdentifiedModel,
     TimestampedModel,
     UTCDatetime,
-    VersionedModel,
 )
 from app.models.enums import AssignmentStrategy, StageStatus, UserRole
 from app.models.exceptions import (
@@ -75,7 +74,7 @@ class StageDefinition(EAHBaseModel):
     escalation_hours: float = Field(gt=0)
 
     @model_validator(mode="after")
-    def _validate_strategy_specific_fields(self) -> "StageDefinition":
+    def _validate_strategy_specific_fields(self) -> StageDefinition:
         """Enforce that each assignment strategy carries its required fields.
 
         Raises:
@@ -117,7 +116,7 @@ class WorkflowDefinitionDocument(EAHBaseModel):
     stages: list[StageDefinition] = Field(min_length=1)
 
     @model_validator(mode="after")
-    def _validate_stage_ordering(self) -> "WorkflowDefinitionDocument":
+    def _validate_stage_ordering(self) -> WorkflowDefinitionDocument:
         """Enforce that stage ``order`` values are unique and contiguous.
 
         Corresponds to WEDD Section 13.1's structural validation: the
@@ -174,7 +173,9 @@ class WorkflowDefinition(IdentifiedModel, TimestampedModel):
         definition: The validated stage configuration document.
         is_active: Whether this version currently governs new requests of
             this type.
-        created_by: The administrator who authored this version.
+        created_by: The administrator who authored this version, or
+            ``None`` if that profile has since been hard-deleted (see
+            ``WorkflowDefinitionRecord.created_by``'s docstring).
         row_version: The optimistic-locking column for this table (DSD
             Section 3.9).
     """
@@ -183,7 +184,7 @@ class WorkflowDefinition(IdentifiedModel, TimestampedModel):
     version: int = Field(ge=1)
     definition: WorkflowDefinitionDocument
     is_active: bool
-    created_by: UUID
+    created_by: UUID | None
     row_version: int = Field(ge=1)
 
 

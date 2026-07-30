@@ -181,7 +181,9 @@ def validate_email(value: str, *, field_name: str = "email") -> str:
     """
     stripped = value.strip()
     if not _EMAIL_PATTERN.match(stripped):
-        raise InputValidationError(field_name, f"'{value}' is not a syntactically valid email address.")
+        raise InputValidationError(
+            field_name, f"'{value}' is not a syntactically valid email address."
+        )
     return stripped
 
 
@@ -206,7 +208,9 @@ def validate_iso8601_datetime(value: str, *, field_name: str = "value") -> datet
     try:
         parsed = parse_iso8601(value)
     except ValueError as exc:
-        raise InputValidationError(field_name, f"'{value}' is not a valid ISO-8601 datetime.") from exc
+        raise InputValidationError(
+            field_name, f"'{value}' is not a valid ISO-8601 datetime."
+        ) from exc
     if parsed.tzinfo is None:
         raise InputValidationError(
             field_name,

@@ -39,6 +39,12 @@ class Notification(IdentifiedModel, TimestampedModel):
             successfully.
         email_sent_at: The timestamp of successful email dispatch, if
             any.
+        archived_at: The timestamp the recipient archived this
+            notification, if any. Archiving only removes a notification
+            from the recipient's default, active view — unlike the
+            soft-deletable tables (DSD Section 3.10), an archived
+            notification is not hidden from every view, only from the
+            default one, and it is fully reversible.
     """
 
     recipient_id: UUID
@@ -49,6 +55,12 @@ class Notification(IdentifiedModel, TimestampedModel):
     read_at: UTCDatetime | None = None
     email_sent: bool
     email_sent_at: UTCDatetime | None = None
+    archived_at: UTCDatetime | None = None
+
+    @property
+    def is_archived(self) -> bool:
+        """Whether the recipient has archived this notification."""
+        return self.archived_at is not None
 
 
 class NotificationCreate(EAHBaseModel):

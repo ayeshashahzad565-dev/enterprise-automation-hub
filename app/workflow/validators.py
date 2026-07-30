@@ -21,7 +21,7 @@ ids the calling Application Service has already fetched.
 from __future__ import annotations
 
 import logging
-from typing import AbstractSet
+from collections.abc import Set as AbstractSet
 from uuid import UUID
 
 from app.models import StageDefinition, WorkflowDefinitionDocument

@@ -19,7 +19,8 @@ import functools
 import logging
 import time
 import warnings
-from typing import Callable, ParamSpec, TypeVar
+from collections.abc import Callable
+from typing import ParamSpec, TypeVar
 
 __all__ = ["log_calls", "timed", "suppress_and_log", "deprecated"]
 

@@ -16,14 +16,14 @@ its foundation and adds the ownership dimension on top.
 
 from __future__ import annotations
 
-from enum import Enum, auto
+from enum import StrEnum
 
 from app.models.enums import UserRole
 
 __all__ = ["Permission", "ROLE_PERMISSIONS"]
 
 
-class Permission(str, Enum):
+class Permission(StrEnum):
     """The fixed catalog of discrete permissions recognized by the system.
 
     Every permission corresponds to a specific capability described in

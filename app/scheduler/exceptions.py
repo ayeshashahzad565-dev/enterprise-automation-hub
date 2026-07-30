@@ -75,6 +75,46 @@ class JobAlreadyRunningError(SchedulerError):
         self.job_name = job_name
 
 
+class NotLeaderError(SchedulerError):
+    """Raised internally when a job's scheduled trigger fires on an
+    instance that does not currently hold Scheduler leadership.
+
+    Caught immediately at the point it is raised (in
+    ``SchedulerCoordinator``'s internal job runner) and never propagates
+    to a caller — mirrors ``JobAlreadyRunningError``'s role, giving this
+    skip condition a precise, named exception rather than an ad hoc
+    boolean check with no corresponding type.
+
+    Attributes:
+        job_name: The job whose trigger fired.
+    """
+
+    def __init__(self, job_name: str) -> None:
+        super().__init__(
+            f"This instance is not the Scheduler leader; skipping job '{job_name}'."
+        )
+        self.job_name = job_name
+
+
+class JobLockedElsewhereError(SchedulerError):
+    """Raised internally when a job's distributed execution lock is
+    already held — by another instance, since this instance's own
+    ``threading.Lock`` for the same job was just successfully acquired.
+
+    Caught immediately at the point it is raised, exactly like
+    ``JobAlreadyRunningError`` and ``NotLeaderError``.
+
+    Attributes:
+        job_name: The job whose distributed lock was already held.
+    """
+
+    def __init__(self, job_name: str) -> None:
+        super().__init__(
+            f"Job '{job_name}' is already running on another instance; skipping this execution."
+        )
+        self.job_name = job_name
+
+
 class SchedulerStartupError(SchedulerError):
     """Raised when the scheduler backend fails to start."""
 

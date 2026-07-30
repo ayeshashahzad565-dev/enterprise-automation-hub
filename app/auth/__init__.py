@@ -3,11 +3,12 @@
 Per the Architecture Design Document and API Design Document, this
 package provides:
 
-- **Authentication** (``authentication``, ``session_manager``): identity
-  establishment from already-verified claims, and session lifecycle
-  management — deliberately independent of any database or network
-  access, since actual credential verification against Supabase Auth
-  belongs to a future service-layer package.
+- **Authentication** (``authentication``): identity establishment from
+  already-verified claims — deliberately independent of any database or
+  network access, since actual credential verification against Supabase
+  Auth belongs to a future service-layer package. JWT validation over
+  HTTP is stateless (API-ADD Section 5.5/5.6), so no server-side session
+  store is used.
 - **Authorization** (``permissions``, ``rbac``, ``authorization``): the
   fixed permission catalog (``permissions``), the pure, role-based and
   ownership-aware predicate functions realizing API-ADD Section 6's rules
@@ -78,7 +79,7 @@ from app.auth.middleware import (
     RequestContext,
 )
 from app.auth.password import hash_password, validate_password_shape, verify_password
-from app.auth.permissions import Permission, ROLE_PERMISSIONS
+from app.auth.permissions import ROLE_PERMISSIONS, Permission
 from app.auth.rbac import (
     can_decide_stage,
     can_edit_request,
@@ -93,7 +94,6 @@ from app.auth.rbac import (
     require_permission,
     require_role,
 )
-from app.auth.session_manager import InMemorySessionStore, Session, SessionManager, SessionStore
 
 __all__ = [
     # authentication
@@ -156,9 +156,4 @@ __all__ = [
     "has_permission",
     "require_permission",
     "require_role",
-    # session_manager
-    "InMemorySessionStore",
-    "Session",
-    "SessionManager",
-    "SessionStore",
 ]

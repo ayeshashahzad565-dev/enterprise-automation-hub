@@ -12,7 +12,8 @@ for a log message).
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Iterator, Sequence, TypeVar
+from collections.abc import Iterable, Iterator, Sequence
+from typing import Any, TypeVar
 
 __all__ = ["chunked", "coalesce", "deep_get", "truncate_string", "first_or_default"]
 

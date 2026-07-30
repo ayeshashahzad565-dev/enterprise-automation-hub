@@ -8,31 +8,29 @@ hardcoded), retry of transient failures uses
 ``app.utils.retry.RetryPolicy``/``retry_call``, and every send attempt is
 bounded by a configurable connection timeout.
 
-This module defines two classes:
-
-- ``SmtpEmailProvider``: implements ``EmailProvider`` (the low-level SMTP
-  capability).
-- ``EmailNotificationChannel``: implements ``NotificationChannel``,
-  adapting an injected ``EmailProvider`` to the channel interface
-  ``NotificationManager`` invokes uniformly, including the graceful
-  no-recipient-address skip described in ``notification_factory``'s
-  docstring.
+This module defines one class, ``SmtpEmailProvider``, which implements
+``EmailProvider`` (the low-level SMTP capability) — the SMTP mechanism
+reused by ``app.services.notification_service.NotificationService`` (via
+``app.bootstrap``'s ``_EmailSenderAdapter``), ``app.services.
+invitation_email.SmtpInvitationEmailSender``, and ``app.jobs.handlers``'s
+queued-email job handlers, so no second SMTP implementation exists
+anywhere in this codebase.
 """
 
 from __future__ import annotations
 
 import logging
 import smtplib
+import socket
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import make_msgid
 
 from app.config.settings import SmtpSettings
 from app.notifications.exceptions import EmailDeliveryError, NotificationConfigurationError
-from app.notifications.interfaces import ChannelDeliveryResult, NotificationChannel
-from app.notifications.notification_factory import NotificationPayload
 from app.utils.retry import RetryPolicy, retry_call
 
-__all__ = ["SmtpEmailProvider", "EmailNotificationChannel"]
+__all__ = ["SmtpEmailProvider"]
 
 logger = logging.getLogger(__name__)
 
@@ -45,13 +43,33 @@ _DEFAULT_TIMEOUT_SECONDS = 10.0
 #: recipient-refusal failures (``smtplib.SMTPAuthenticationError``,
 #: ``smtplib.SMTPRecipientsRefused``), which are permanent and should
 #: fail immediately rather than being retried.
+#:
+#: Per Milestone 9's Email Delivery Resilience audit: this tuple
+#: previously included a bare ``OSError`` (intended to additionally catch
+#: raw socket-level failures, e.g. DNS resolution errors, not already
+#: covered by the more specific entries below) — but Python's
+#: ``smtplib.SMTPException`` itself subclasses ``OSError`` (confirmed:
+#: ``smtplib.SMTPException.__mro__`` includes ``OSError``), so that bare
+#: entry silently caught *every* smtplib exception, including
+#: ``SMTPAuthenticationError``/``SMTPRecipientsRefused`` — directly
+#: contradicting this comment's own stated intent, and this class's
+#: ``send_email`` docstring, which both already documented "excluded,
+#: fails immediately" as the intended behavior. ``socket.gaierror``
+#: (DNS resolution failure) replaces the bare ``OSError`` entry: it is
+#: the specific, genuinely transient, non-smtplib case the blanket entry
+#: was reasonably trying to cover, without also matching every smtplib
+#: protocol-level exception. ``ConnectionRefusedError``/
+#: ``ConnectionResetError``/``ConnectionAbortedError``/``BrokenPipeError``
+#: remain covered via ``ConnectionError`` below (all four are its
+#: subclasses); ``socket.timeout`` is an alias of ``TimeoutError`` as of
+#: Python 3.10, already covered too.
 _RETRYABLE_SMTP_EXCEPTIONS: tuple[type[BaseException], ...] = (
     smtplib.SMTPConnectError,
     smtplib.SMTPServerDisconnected,
     smtplib.SMTPHeloError,
     TimeoutError,
     ConnectionError,
-    OSError,
+    socket.gaierror,
 )
 
 
@@ -86,17 +104,39 @@ class SmtpEmailProvider:
 
         Raises:
             NotificationConfigurationError: If ``settings.is_enabled`` is
-                ``False`` — constructing a provider from disabled
-                settings would silently produce a provider that can
-                never succeed, which is a configuration error, not a
-                runtime condition to degrade from.
+                ``False``, or any individual field is unset despite
+                ``host`` being present — constructing a provider from
+                disabled or incomplete settings would silently produce a
+                provider that can never succeed, which is a
+                configuration error, not a runtime condition to degrade
+                from.
         """
         if not settings.is_enabled:
             raise NotificationConfigurationError(
                 "Cannot construct an SmtpEmailProvider: SMTP is not configured "
                 "(app.config.settings.SmtpSettings.is_enabled is False)."
             )
-        self._settings = settings
+        if (
+            settings.host is None
+            or settings.port is None
+            or settings.username is None
+            or settings.password is None
+            or settings.from_address is None
+        ):
+            raise NotificationConfigurationError(
+                "Cannot construct an SmtpEmailProvider: SMTP_HOST is set but "
+                "SMTP_PORT/SMTP_USERNAME/SMTP_PASSWORD/SMTP_FROM_ADDRESS are "
+                "not all set."
+            )
+        # Narrowed, non-Optional copies of the settings validated above —
+        # SmtpSettings itself keeps every field Optional (host alone
+        # gates is_enabled), so these are what _send_once/_build_message
+        # actually use.
+        self._host: str = settings.host
+        self._port: int = settings.port
+        self._username: str = settings.username
+        self._password: str = settings.password
+        self._from_address: str = settings.from_address
         self._timeout_seconds = timeout_seconds
         self._retry_policy = retry_policy or RetryPolicy(
             max_attempts=3,
@@ -149,13 +189,18 @@ class SmtpEmailProvider:
             raise EmailDeliveryError(to_address, str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - translated into a typed error below
             self._logger.error(
-                "Failed to send email to %s: %s", to_address, exc, exc_info=exc,
+                "Failed to send email to %s: %s",
+                to_address,
+                exc,
+                exc_info=exc,
                 extra={"to_address": to_address},
             )
             raise EmailDeliveryError(to_address, str(exc)) from exc
 
         self._logger.info(
-            "Email sent to %s (subject=%r)", to_address, subject,
+            "Email sent to %s (subject=%r)",
+            to_address,
+            subject,
             extra={"to_address": to_address},
         )
 
@@ -170,17 +215,30 @@ class SmtpEmailProvider:
             smtplib.SMTPException: On any SMTP-protocol-level failure.
             OSError: On a connection-level failure (including timeout).
         """
-        with smtplib.SMTP(
-            self._settings.host, self._settings.port, timeout=self._timeout_seconds
-        ) as connection:
+        with smtplib.SMTP(self._host, self._port, timeout=self._timeout_seconds) as connection:
             connection.starttls()
-            connection.login(self._settings.username, self._settings.password)
-            connection.sendmail(self._settings.from_address, [to_address], message.as_string())
+            connection.login(self._username, self._password)
+            connection.sendmail(self._from_address, [to_address], message.as_string())
 
     def _build_message(
         self, *, to_address: str, subject: str, text_body: str, html_body: str | None
     ) -> MIMEMultipart:
         """Construct a MIME message, multipart if an HTML body is provided.
+
+        Per Milestone 9's Email Delivery Resilience audit: this method is
+        called exactly once per ``send_email`` call, *before*
+        ``retry_call`` retries ``_send_once`` against the same message
+        object — so the ``Message-ID`` generated here is identical across
+        every retry attempt of one logical send. Without a stable
+        ``Message-ID``, a retry after a delivery that actually succeeded
+        server-side but failed client-side (e.g. the connection dropped
+        while reading the server's final acknowledgement, a scenario
+        ``_RETRYABLE_SMTP_EXCEPTIONS`` explicitly retries) would produce
+        two messages a receiving mail system has no way to recognize as
+        duplicates of each other. A stable id does not *guarantee*
+        dedup — that is the receiving system's own behavior, outside this
+        codebase's control — but it is the standard, minimal signal this
+        codebase can provide, and does not exist without this call.
 
         Args:
             to_address: The recipient's email address.
@@ -193,77 +251,10 @@ class SmtpEmailProvider:
         """
         message = MIMEMultipart("alternative")
         message["Subject"] = subject
-        message["From"] = self._settings.from_address
+        message["From"] = self._from_address
         message["To"] = to_address
+        message["Message-ID"] = make_msgid()
         message.attach(MIMEText(text_body, "plain", "utf-8"))
         if html_body is not None:
             message.attach(MIMEText(html_body, "html", "utf-8"))
         return message
-
-
-class EmailNotificationChannel(NotificationChannel):
-    """Adapts an ``EmailProvider`` to the ``NotificationChannel`` interface.
-
-    Contains no SMTP implementation details of its own — it delegates
-    entirely to the injected ``EmailProvider`` and never raises for an
-    ordinary delivery failure, reporting it via ``ChannelDeliveryResult``
-    instead, per ``NotificationChannel``'s documented contract.
-    """
-
-    def __init__(self, *, email_provider: SmtpEmailProvider) -> None:
-        """Initialize the channel with an injected email provider.
-
-        Args:
-            email_provider: Any object satisfying the ``EmailProvider``
-                protocol.
-        """
-        self._email_provider = email_provider
-        self._logger = logging.getLogger(f"{__name__}.EmailNotificationChannel")
-
-    @property
-    def channel_name(self) -> str:
-        """This channel's stable identifier, ``"email"``."""
-        return "email"
-
-    def deliver(self, payload: NotificationPayload) -> ChannelDeliveryResult:
-        """Attempt to deliver a notification payload via email.
-
-        Args:
-            payload: The notification payload to deliver.
-
-        Returns:
-            A ``ChannelDeliveryResult`` describing the outcome. If
-            ``payload.recipient_email`` is ``None`` (see
-            ``NotificationPayload``'s docstring for why this can happen),
-            this method skips delivery and reports that outcome rather
-            than treating it as a failure needing an exception.
-        """
-        if payload.recipient_email is None:
-            self._logger.debug(
-                "Skipping email delivery for notification to %s: no recipient email available.",
-                payload.recipient_id,
-                extra={"recipient_id": str(payload.recipient_id)},
-            )
-            return ChannelDeliveryResult(
-                channel_name=self.channel_name,
-                success=False,
-                detail="no recipient email address was available",
-            )
-
-        try:
-            self._email_provider.send_email(
-                to_address=payload.recipient_email,
-                subject=payload.title,
-                text_body=payload.message,
-                html_body=payload.html_message,
-            )
-        except EmailDeliveryError as exc:
-            self._logger.warning(
-                "Email channel delivery failed for recipient %s: %s",
-                payload.recipient_id,
-                exc,
-                extra={"recipient_id": str(payload.recipient_id)},
-            )
-            return ChannelDeliveryResult(channel_name=self.channel_name, success=False, detail=str(exc))
-
-        return ChannelDeliveryResult(channel_name=self.channel_name, success=True)

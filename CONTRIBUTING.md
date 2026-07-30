@@ -2,7 +2,7 @@
 
 Thank you for your interest in contributing to Enterprise Automation Hub (EAH). This document describes how to set up a development environment, the conventions this project follows, and what is expected of a pull request before it can be merged.
 
-EAH is a modular monolith by design. Contributions should reinforce that architecture — see the [Architecture Design Document](docs/ADD.md) before proposing any change that introduces a new service, dependency, or infrastructure component.
+EAH is a modular monolith by design. Contributions should reinforce that architecture — see the [Architecture Design Document](docs/architecture.md) before proposing any change that introduces a new service, dependency, or infrastructure component.
 
 ## Table of Contents
 
@@ -30,6 +30,13 @@ EAH is a modular monolith by design. Contributions should reinforce that archite
    pip install -e ".[dev]"
 ```
 
+   For a fully reproducible install of the exact versions CI tests
+   against (rather than whatever the resolver picks from
+   `pyproject.toml`'s ranges today), install from the hash-pinned lockfile
+   instead: `pip install -r requirements-dev.txt`. Both are kept in sync —
+   `requirements-dev.txt` is generated from `pyproject.toml` via
+   `pip-compile` and CI fails if it ever drifts out of date.
+
 3. **Configure your environment.**
 
 ```bash
@@ -49,6 +56,16 @@ EAH is a modular monolith by design. Contributions should reinforce that archite
 ```bash
    pytest -m unit
 ```
+
+For the full Playwright end-to-end suite (login/logout, requests,
+approvals, analytics, Platform Administration, tenant isolation, session
+expiry) against a real local Supabase stack, see
+[`frontend/e2e/README.md`](frontend/e2e/README.md).
+
+For the real-database integration suite (repository CRUD, schema
+constraints, and Row-Level Security policy enforcement — `pytest
+tests/integration`), which needs its own dedicated test database and runs
+in its own CI job, see [`tests/integration/README.md`](tests/integration/README.md).
 
 ## Branch Naming
 

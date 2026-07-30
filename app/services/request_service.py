@@ -21,21 +21,24 @@ workflow outcome itself.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Sequence
+from datetime import datetime
 from uuid import UUID
 
 from pydantic import ValidationError as PydanticValidationError
 
 from app.auth.authentication import AuthenticatedIdentity
 from app.auth.authorization import (
+    authorize_audit_trail_view,
     authorize_request_edit,
     authorize_request_view,
     authorize_request_withdrawal,
 )
 from app.database.exceptions import DatabaseError, RecordNotFoundError
+from app.database.repositories.approval_repository import ApprovalRepository
 from app.database.repositories.audit_repository import AuditRepository
-from app.database.repositories.base_repository import Page, PagedResult
+from app.database.repositories.base_repository import MAX_PAGE_SIZE, Page, PagedResult
 from app.database.repositories.request_repository import RequestRecord, RequestRepository
 from app.database.repositories.user_repository import ProfileRecord, ProfileRepository
 from app.database.repositories.workflow_repository import (
@@ -43,12 +46,10 @@ from app.database.repositories.workflow_repository import (
     WorkflowStageRepository,
 )
 from app.models import Profile, Request, RequestCreate, RequestUpdate
-from app.models.enums import AuditAction, RequestStatus, UserRole
+from app.models.enums import AuditAction, RequestStatus, StageStatus, UserRole
 from app.models.exceptions import DomainError
 from app.services.exceptions import (
     NotFoundError,
-    PermissionDeniedError,
-    ValidationError,
     translate_auth_error,
     translate_database_error,
     translate_model_construction_error,
@@ -59,13 +60,20 @@ from app.services.workflow_definition_service import (
     TransactionContext,
     map_workflow_definition_record_to_domain,
 )
-from app.utils.datetime_utils import utc_now
 from app.utils.decorators import log_calls
 from app.workflow.constants import ASSIGNMENT_FALLBACK_METADATA_KEY
-from app.workflow.engine import StagePlan, WorkflowEngine
+from app.workflow.engine import WorkflowEngine
 from app.workflow.exceptions import WorkflowError as EngineWorkflowError
 
-__all__ = ["map_profile_record_to_domain", "map_request_record_to_domain", "RequestService"]
+__all__ = [
+    "map_profile_record_to_domain",
+    "map_request_record_to_domain",
+    "RequestService",
+    "WorkflowStageDetail",
+    "UpcomingStage",
+    "WorkflowProgress",
+    "AuditEntryDetail",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +96,8 @@ def map_profile_record_to_domain(record: ProfileRecord) -> Profile:
         version=record.version,
         created_at=record.created_at,
         updated_at=record.updated_at,
+        company_id=record.company_id,
+        is_platform_admin=record.is_platform_admin,
     )
 
 
@@ -120,6 +130,109 @@ def map_request_record_to_domain(record: RequestRecord) -> Request:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class WorkflowStageDetail:
+    """A single workflow stage, enriched for read-only presentation.
+
+    Unlike ``app.models.workflow.WorkflowStage`` (the persisted-row
+    representation, which carries only raw ids), every user-facing field
+    here is already resolved to something a page can display directly —
+    no page needs to separately look up a profile id to show a name.
+
+    Attributes:
+        stage_id: The stage's id.
+        stage_order: The stage's 1-indexed position in the approval chain.
+        stage_name: The stage's human-readable label.
+        assigned_to_name: The specific assignee's display name, or
+            ``None`` if the stage is assigned to a role-eligible pool
+            instead of a specific person.
+        assigned_role: The role eligible to act on this stage, if not
+            assigned to a specific person.
+        status: The stage's current decision status.
+        created_at: When this stage was materialized.
+        decided_at: When this stage was decided, if it has been.
+        decided_by_name: The display name of whoever actually decided
+            this stage, if it has been decided.
+        decision_note: The note recorded with the decision, if any.
+        is_escalated: Whether this stage has ever been escalated (per a
+            ``STAGE_ESCALATED`` audit entry referencing it) — independent
+            of ``status``, since escalation reassigns a stage without
+            changing its status away from ``pending``.
+    """
+
+    stage_id: UUID
+    stage_order: int
+    stage_name: str
+    assigned_to_name: str | None
+    assigned_role: UserRole | None
+    status: StageStatus
+    created_at: datetime
+    decided_at: datetime | None
+    decided_by_name: str | None
+    decision_note: str | None
+    is_escalated: bool
+
+
+@dataclass(frozen=True, slots=True)
+class UpcomingStage:
+    """A stage the workflow definition defines but has not yet reached.
+
+    Attributes:
+        stage_order: The stage's 1-indexed position in the approval chain.
+        stage_name: The stage's human-readable label.
+    """
+
+    stage_order: int
+    stage_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowProgress:
+    """A request's complete workflow stage history plus its position
+    within the governing workflow definition's total stage count.
+
+    Attributes:
+        stages: Every stage materialized for the request so far, ordered
+            by ``stage_order`` ascending.
+        upcoming_stages: The stages the workflow definition defines but
+            has not yet materialized, in order — genuinely known in
+            advance (stages are authored up front as part of the
+            definition; only their materialization as a
+            ``workflow_stages`` row happens incrementally), never a guess.
+        current_stage_order: The order of the stage currently awaiting a
+            decision, or — once the request has reached a terminal
+            status — the order of the last stage that was ever
+            materialized (never a stage number the request never
+            actually reached).
+        total_stages: The total number of stages defined by the
+            workflow definition governing this request, regardless of
+            how many have been materialized so far.
+    """
+
+    stages: list[WorkflowStageDetail]
+    upcoming_stages: list[UpcomingStage]
+    current_stage_order: int
+    total_stages: int
+
+
+@dataclass(frozen=True, slots=True)
+class AuditEntryDetail:
+    """A single audit log entry, enriched for read-only presentation.
+
+    Attributes:
+        action: The recorded action code.
+        actor_name: The acting user's display name, or ``None`` for a
+            system-initiated action (e.g. a Scheduler escalation).
+        created_at: When the action occurred.
+        metadata: The structured snapshot recorded with the entry, if any.
+    """
+
+    action: AuditAction
+    actor_name: str | None
+    created_at: datetime
+    metadata: dict[str, object] | None
+
+
 class RequestService:
     """Orchestrates request creation, editing, withdrawal, and read access."""
 
@@ -133,6 +246,7 @@ class RequestService:
         audit_repo: AuditRepository,
         notification_service: NotificationService,
         workflow_engine: WorkflowEngine,
+        approval_repo: ApprovalRepository,
     ) -> None:
         """Initialize the service with its injected collaborators.
 
@@ -150,6 +264,11 @@ class RequestService:
             notification_service: The service used to dispatch the
                 first-stage assignment notification after commit.
             workflow_engine: The composed Workflow Engine facade.
+            approval_repo: Persistence for ``workflow_stages``' decision
+                fields, used by ``list_requests``/``search_requests`` to
+                scope an approver's results to requests with a pending
+                stage resolved or role-eligible to them (API-ADD's
+                Approver permission: "may not view unrelated requests").
         """
         self._request_repo = request_repo
         self._workflow_definition_repo = workflow_definition_repo
@@ -158,6 +277,7 @@ class RequestService:
         self._audit_repo = audit_repo
         self._notification_service = notification_service
         self._workflow_engine = workflow_engine
+        self._approval_repo = approval_repo
         self._logger = logging.getLogger(f"{__name__}.RequestService")
 
     @log_calls()
@@ -205,21 +325,28 @@ class RequestService:
         """
         try:
             payload = RequestCreate(
-                request_type=request_type, title=title, description=description, department=department
+                request_type=request_type,
+                title=title,
+                description=description,
+                department=department,
             )
         except (PydanticValidationError, DomainError) as exc:
             raise translate_model_construction_error(exc, model_name="RequestCreate") from exc
 
         try:
             candidates = self._workflow_definition_repo.list_definitions(
-                request_type=payload.request_type, is_active=True, page=Page(size=10)
+                request_type=payload.request_type,
+                company_id=identity.company_id,
+                is_active=True,
+                page=Page(size=10),
             ).items
         except DatabaseError as exc:
             raise translate_database_error(exc) from exc
+        candidate_domains = [map_workflow_definition_record_to_domain(c) for c in candidates]
 
         try:
             definition_domain = self._workflow_engine.resolve_definition(
-                payload.request_type, candidates
+                payload.request_type, candidate_domains
             )
         except EngineWorkflowError as exc:
             raise translate_workflow_error(exc) from exc
@@ -231,7 +358,7 @@ class RequestService:
         requester_domain = map_profile_record_to_domain(requester_record)
 
         department_approvers = self._fetch_department_approvers_if_needed(
-            definition_domain, requester_domain
+            definition_domain, requester_domain, company_id=identity.company_id
         )
 
         plan = self._workflow_engine.plan_first_stage(
@@ -246,25 +373,28 @@ class RequestService:
                     workflow_definition_id=definition_domain.id,
                     request_type=payload.request_type,
                     title=payload.title,
+                    company_id=identity.company_id,
                     description=payload.description,
                     department=payload.department,
                 )
             except DatabaseError as exc:
                 raise translate_database_error(exc) from exc
 
-            tx.register_compensation(
-                lambda: self._request_repo.soft_delete(
+            def _compensate_create_request() -> None:
+                self._request_repo.soft_delete(
                     created_request.id,  # type: ignore[union-attr]
                     expected_version=created_request.version,  # type: ignore[union-attr]
                     deleted_by=identity.user_id,
                 )
-            )
+
+            tx.register_compensation(_compensate_create_request)
 
             try:
                 created_stage = self._workflow_stage_repo.create_stage(
                     request_id=created_request.id,
                     stage_order=plan.stage_order,
                     stage_name=plan.stage_name,
+                    company_id=identity.company_id,
                     assigned_role=plan.assigned_role,
                     assigned_to=plan.assigned_to,
                 )
@@ -332,9 +462,13 @@ class RequestService:
             record = self._request_repo.get_by_id(request_id)
         except RecordNotFoundError as exc:
             raise translate_database_error(exc) from exc
+        if record.company_id != identity.company_id:
+            raise NotFoundError("request", request_id)
 
         is_requester = record.requester_id == identity.user_id
-        is_assigned_approver = self._is_assigned_to_any_stage(record.id, identity.user_id, identity.role)
+        is_assigned_approver = self._is_assigned_to_any_stage(
+            record.id, identity.user_id, identity.role
+        )
 
         try:
             authorize_request_view(
@@ -347,6 +481,174 @@ class RequestService:
             raise NotFoundError("request", request_id) from exc
 
         return map_request_record_to_domain(record)
+
+    @log_calls()
+    def get_workflow_progress(
+        self, identity: AuthenticatedIdentity, request_id: UUID
+    ) -> WorkflowProgress:
+        """Retrieve a request's complete workflow stage history and progress.
+
+        Read-only: this method performs no workflow decision-making of
+        its own and never mutates a stage — it only assembles data
+        already produced by ``ApprovalService``/the Workflow Engine
+        (stage records, the request's pinned workflow definition, and
+        escalation audit entries) into a single, presentation-ready view.
+
+        Visibility matches ``get_request``'s own rule exactly: the
+        requester, an approver assigned to any of the request's stages,
+        or an administrator.
+
+        Args:
+            identity: The authenticated caller.
+            request_id: The request's id.
+
+        Returns:
+            A ``WorkflowProgress`` describing every stage materialized so
+            far, enriched with resolved assignee/decider display names
+            and escalation status, plus the request's position within
+            its workflow definition's total stage count.
+
+        Raises:
+            NotFoundError: If no request with this id exists, or it is
+                outside the caller's visibility.
+        """
+        try:
+            record = self._request_repo.get_by_id(request_id)
+        except RecordNotFoundError as exc:
+            raise translate_database_error(exc) from exc
+        if record.company_id != identity.company_id:
+            raise NotFoundError("request", request_id)
+
+        is_requester = record.requester_id == identity.user_id
+        is_assigned_approver = self._is_assigned_to_any_stage(
+            record.id, identity.user_id, identity.role
+        )
+        try:
+            authorize_request_view(
+                identity, is_requester=is_requester, is_assigned_approver=is_assigned_approver
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise NotFoundError("request", request_id) from exc
+
+        try:
+            stage_records = self._workflow_stage_repo.list_for_request(
+                request_id, page=Page(size=100)
+            ).items
+        except DatabaseError as exc:
+            raise translate_database_error(exc) from exc
+
+        try:
+            audit_entries = self._audit_repo.list_for_request(request_id, page=Page(size=100)).items
+        except DatabaseError as exc:
+            raise translate_database_error(exc) from exc
+        escalated_stage_ids = {
+            entry.metadata.get("stage_id")
+            for entry in audit_entries
+            if entry.action == AuditAction.STAGE_ESCALATED.value and entry.metadata
+        }
+
+        resolve_name = self._build_profile_name_resolver()
+        stages = [
+            WorkflowStageDetail(
+                stage_id=stage.id,
+                stage_order=stage.stage_order,
+                stage_name=stage.stage_name,
+                assigned_to_name=resolve_name(stage.assigned_to),
+                assigned_role=stage.assigned_role,
+                status=stage.status,
+                created_at=stage.created_at,
+                decided_at=stage.decided_at,
+                decided_by_name=resolve_name(stage.decided_by),
+                decision_note=stage.decision_note,
+                is_escalated=str(stage.id) in escalated_stage_ids,
+            )
+            for stage in stage_records
+        ]
+
+        try:
+            definition_record = self._workflow_definition_repo.get_by_id(
+                record.workflow_definition_id
+            )
+        except RecordNotFoundError as exc:
+            raise translate_database_error(exc) from exc
+        stage_defs = definition_record.definition.get("stages", [])
+        total_stages = len(stage_defs)
+        materialized_orders = {stage.stage_order for stage in stages}
+        upcoming_stages = [
+            UpcomingStage(stage_order=stage_def["order"], stage_name=stage_def["name"])
+            for stage_def in sorted(stage_defs, key=lambda stage_def: stage_def["order"])
+            if stage_def["order"] not in materialized_orders
+        ]
+
+        pending_stage = next((s for s in stages if s.status is StageStatus.PENDING), None)
+        if pending_stage is not None:
+            current_stage_order = pending_stage.stage_order
+        elif stages:
+            current_stage_order = stages[-1].stage_order
+        else:
+            current_stage_order = 0
+
+        return WorkflowProgress(
+            stages=stages,
+            upcoming_stages=upcoming_stages,
+            current_stage_order=current_stage_order,
+            total_stages=total_stages,
+        )
+
+    @log_calls()
+    def get_audit_trail(
+        self, identity: AuthenticatedIdentity, request_id: UUID
+    ) -> list[AuditEntryDetail]:
+        """Retrieve a request's complete audit trail, chronologically.
+
+        Visibility follows API-ADD Section 19.10.1: the same population
+        permitted to view the request itself.
+
+        Args:
+            identity: The authenticated caller.
+            request_id: The request's id.
+
+        Returns:
+            The request's audit entries, oldest first, with each entry's
+            actor resolved to a display name.
+
+        Raises:
+            NotFoundError: If no request with this id exists, or it is
+                outside the caller's visibility.
+        """
+        try:
+            record = self._request_repo.get_by_id(request_id)
+        except RecordNotFoundError as exc:
+            raise translate_database_error(exc) from exc
+        if record.company_id != identity.company_id:
+            raise NotFoundError("request", request_id)
+
+        is_requester = record.requester_id == identity.user_id
+        is_assigned_approver = self._is_assigned_to_any_stage(
+            record.id, identity.user_id, identity.role
+        )
+        try:
+            authorize_audit_trail_view(
+                identity, is_requester=is_requester, is_assigned_approver=is_assigned_approver
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise NotFoundError("request", request_id) from exc
+
+        try:
+            entries = self._audit_repo.list_for_request(request_id, page=Page(size=100)).items
+        except DatabaseError as exc:
+            raise translate_database_error(exc) from exc
+
+        resolve_name = self._build_profile_name_resolver()
+        return [
+            AuditEntryDetail(
+                action=AuditAction(entry.action),
+                actor_name=resolve_name(entry.actor_id),
+                created_at=entry.created_at,
+                metadata=entry.metadata,
+            )
+            for entry in entries
+        ]
 
     @log_calls()
     def list_requests(
@@ -379,15 +681,22 @@ class RequestService:
             A ``PagedResult`` of matching ``Request`` instances.
         """
         requester_filter: UUID | None = None
+        request_ids_filter: list[UUID] | None = None
         if identity.role is UserRole.EMPLOYEE:
             requester_filter = identity.user_id
+        elif identity.role is UserRole.APPROVER:
+            request_ids_filter = self._visible_request_ids_for_approver(identity)
+            if not request_ids_filter:
+                return PagedResult(items=[], page=page.number, page_size=page.size, total_records=0)
 
         try:
             result = self._request_repo.list_requests(
+                company_id=identity.company_id,
                 status=status,
                 request_type=request_type,
                 department=department,
                 requester_id=requester_filter,
+                request_ids=request_ids_filter,
                 page=page,
             )
         except DatabaseError as exc:
@@ -417,21 +726,59 @@ class RequestService:
         Raises:
             ValidationError: If ``query_text`` is empty.
         """
+        requester_filter: UUID | None = None
+        request_ids_filter: list[UUID] | None = None
+        if identity.role is UserRole.EMPLOYEE:
+            requester_filter = identity.user_id
+        elif identity.role is UserRole.APPROVER:
+            request_ids_filter = self._visible_request_ids_for_approver(identity)
+            if not request_ids_filter:
+                return PagedResult(items=[], page=page.number, page_size=page.size, total_records=0)
+
         try:
-            result = self._request_repo.search_requests(query_text, page=page)
+            result = self._request_repo.search_requests(
+                query_text,
+                company_id=identity.company_id,
+                requester_id=requester_filter,
+                request_ids=request_ids_filter,
+                page=page,
+            )
         except DatabaseError as exc:
             raise translate_database_error(exc) from exc
 
-        items = result.items
-        if identity.role is UserRole.EMPLOYEE:
-            items = [r for r in items if r.requester_id == identity.user_id]
-
         return PagedResult(
-            items=[map_request_record_to_domain(r) for r in items],
+            items=[map_request_record_to_domain(r) for r in result.items],
             page=result.page,
             page_size=result.page_size,
             total_records=result.total_records,
         )
+
+    def _visible_request_ids_for_approver(self, identity: AuthenticatedIdentity) -> list[UUID]:
+        """Return the request ids an approver may browse or search.
+
+        Matches the Approver permission documented in API-ADD Section 6.2:
+        "may view requests where they are the resolved or role-eligible
+        assignee on a pending stage... may not view unrelated requests."
+        Bounded to the first ``MAX_PAGE_SIZE`` matching stages, the same
+        bound this service's own ``_is_assigned_to_any_stage`` already
+        applies per-request, reasonable at this application's documented
+        scale (SRS Section 12.1: up to 50 concurrent users).
+
+        Args:
+            identity: The authenticated approver.
+
+        Returns:
+            The distinct request ids with at least one pending stage
+            assigned to this user or eligible for their role. Empty if
+            none.
+        """
+        stages = self._approval_repo.list_pending_for_approver(
+            company_id=identity.company_id,
+            assigned_to=identity.user_id,
+            assigned_role=identity.role,
+            page=Page(size=MAX_PAGE_SIZE),
+        ).items
+        return list({stage.request_id for stage in stages})
 
     @log_calls()
     def update_request(
@@ -474,6 +821,8 @@ class RequestService:
             record = self._request_repo.get_by_id(request_id)
         except RecordNotFoundError as exc:
             raise translate_database_error(exc) from exc
+        if record.company_id != identity.company_id:
+            raise NotFoundError("request", request_id)
 
         try:
             authorize_request_edit(
@@ -526,6 +875,8 @@ class RequestService:
             record = self._request_repo.get_by_id(request_id)
         except RecordNotFoundError as exc:
             raise translate_database_error(exc) from exc
+        if record.company_id != identity.company_id:
+            raise NotFoundError("request", request_id)
 
         try:
             authorize_request_withdrawal(
@@ -555,7 +906,7 @@ class RequestService:
         return map_request_record_to_domain(updated)
 
     def _fetch_department_approvers_if_needed(
-        self, definition, requester: Profile
+        self, definition, requester: Profile, *, company_id: UUID
     ) -> Sequence[Profile]:
         """Fetch the department-approver candidate pool only when the
         definition's first stage actually needs it.
@@ -563,6 +914,8 @@ class RequestService:
         Args:
             definition: The resolved workflow definition.
             requester: The requester's profile.
+            company_id: The company (tenant) to restrict the candidate
+                pool to — always the caller's own ``identity.company_id``.
 
         Returns:
             A list of candidate ``Profile`` instances, or an empty list if
@@ -576,7 +929,10 @@ class RequestService:
 
         try:
             records = self._profile_repo.list_by_role(
-                UserRole.APPROVER, department=requester.department, page=Page(size=100)
+                UserRole.APPROVER,
+                company_id=company_id,
+                department=requester.department,
+                page=Page(size=100),
             ).items
         except DatabaseError as exc:
             raise translate_database_error(exc) from exc
@@ -597,6 +953,33 @@ class RequestService:
         if role not in (UserRole.APPROVER, UserRole.ADMIN):
             return False
         stages = self._workflow_stage_repo.list_for_request(request_id, page=Page(size=100)).items
-        return any(
-            stage.assigned_to == user_id or stage.assigned_role == role for stage in stages
-        )
+        return any(stage.assigned_to == user_id or stage.assigned_role == role for stage in stages)
+
+    def _build_profile_name_resolver(self) -> Callable[[UUID | None], str | None]:
+        """Return a callable resolving a profile id to its display name.
+
+        The returned callable caches each id it resolves for the
+        lifetime of the single call site that requested it (never across
+        separate ``get_workflow_progress``/``get_audit_trail`` calls), so
+        a request's stages/audit entries referencing the same user
+        repeatedly are only looked up once, without risking a stale name
+        surviving across unrelated calls.
+
+        Returns:
+            A callable ``(profile_id) -> display_name``, tolerating a
+            ``None`` input (returns ``None``) and a profile id that no
+            longer resolves to any row (returns ``"Unknown user"`` rather
+            than raising, since a missing profile must never break an
+            otherwise-valid history view).
+        """
+        cache: dict[UUID, str] = {}
+
+        def resolve(profile_id: UUID | None) -> str | None:
+            if profile_id is None:
+                return None
+            if profile_id not in cache:
+                profile = self._profile_repo.find_by_id(profile_id)
+                cache[profile_id] = profile.full_name if profile is not None else "Unknown user"
+            return cache[profile_id]
+
+        return resolve

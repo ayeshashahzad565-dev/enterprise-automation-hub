@@ -27,7 +27,8 @@ from __future__ import annotations
 
 import functools
 import logging
-from typing import Callable, ParamSpec, TypeVar
+from collections.abc import Callable
+from typing import ParamSpec, TypeVar
 
 from app.auth import authorization
 from app.auth.authentication import AuthenticatedIdentity

@@ -16,7 +16,7 @@ candidate set, such as every version for a request type).
 from __future__ import annotations
 
 import logging
-from typing import Iterable
+from collections.abc import Iterable
 
 from app.models import WorkflowDefinition
 from app.workflow.exceptions import MultipleActiveDefinitionsError, NoActiveDefinitionError

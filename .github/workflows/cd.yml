@@ -1,0 +1,102 @@
+name: CD
+
+# Builds and publishes Docker images for the backend and frontend to
+# GitHub Container Registry (GHCR) on every push to `main` (after CI has
+# already run against that same commit as a required check) and on every
+# `v*` tag. Authenticates with the automatically-provisioned
+# GITHUB_TOKEN — no additional secrets to configure.
+#
+# This workflow deliberately stops at "image published." Deploying a
+# published image to a specific production host is an operator decision
+# this repository cannot make on its own (no target host/credentials
+# exist here) — see docs/docker_deployment.md's "Deploying a new image"
+# section for the documented, manual/pluggable next step (e.g. `docker
+# compose pull && docker compose up -d` on the target host, or wiring in
+# an SSH/webhook deploy job once a real target exists).
+
+"on":
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-push-backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}-backend
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=tag
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  build-push-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}-frontend
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=tag
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # NEXT_PUBLIC_* are baked in at build time (Next.js convention).
+          # These placeholders satisfy src/lib/supabase/env.ts's
+          # module-load-time validation only — they never contact
+          # Supabase at build time (matching ci.yml's identical
+          # CI-placeholder pattern) and are not a substitute for a real
+          # deployment's own build, which should supply the real project's
+          # values as repository variables if this pipeline is later
+          # pointed at a specific environment.
+          build-args: |
+            NEXT_PUBLIC_SUPABASE_URL=${{ vars.NEXT_PUBLIC_SUPABASE_URL || 'https://build-placeholder.supabase.co' }}
+            NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ vars.NEXT_PUBLIC_SUPABASE_ANON_KEY || 'build-placeholder-anon-key' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -76,9 +76,7 @@ class JobRegistry:
         """
         with self._lock:
             if job.name in self._registrations:
-                raise JobRegistrationError(
-                    job.name, "a job with this name is already registered."
-                )
+                raise JobRegistrationError(job.name, "a job with this name is already registered.")
             resolved_interval = (
                 interval_seconds if interval_seconds is not None else job.interval_seconds
             )

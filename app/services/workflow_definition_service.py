@@ -21,8 +21,8 @@ does and does not provide.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from typing import Callable, Sequence
+from collections.abc import Callable
+from typing import Literal
 from uuid import UUID
 
 from pydantic import ValidationError as PydanticValidationError
@@ -32,17 +32,16 @@ from app.auth.authorization import authorize_workflow_definition_management
 from app.database.exceptions import DatabaseError, RecordNotFoundError
 from app.database.repositories.audit_repository import AuditRepository
 from app.database.repositories.base_repository import Page, PagedResult
+from app.database.repositories.user_repository import ProfileRepository
 from app.database.repositories.workflow_repository import (
     WorkflowDefinitionRecord,
     WorkflowDefinitionRepository,
 )
-from app.database.repositories.user_repository import ProfileRepository
 from app.models import WorkflowDefinition, WorkflowDefinitionDocument
 from app.models.enums import AuditAction
 from app.models.exceptions import DomainError
 from app.services.exceptions import (
     NotFoundError,
-    ValidationError,
     translate_auth_error,
     translate_database_error,
     translate_model_construction_error,
@@ -52,7 +51,11 @@ from app.utils.decorators import log_calls
 from app.workflow.engine import WorkflowEngine
 from app.workflow.exceptions import WorkflowError as EngineWorkflowError
 
-__all__ = ["TransactionContext", "map_workflow_definition_record_to_domain", "WorkflowDefinitionService"]
+__all__ = [
+    "TransactionContext",
+    "map_workflow_definition_record_to_domain",
+    "WorkflowDefinitionService",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -106,17 +109,21 @@ class TransactionContext:
         """
         self._compensations.append(action)
 
-    def __enter__(self) -> "TransactionContext":
+    def __enter__(self) -> TransactionContext:
         self._logger.debug(
-            "Beginning orchestrated operation '%s'", self._operation_name,
+            "Beginning orchestrated operation '%s'",
+            self._operation_name,
             extra={"operation": self._operation_name},
         )
         return self
 
-    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object) -> bool:
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object
+    ) -> Literal[False]:
         if exc_type is None:
             self._logger.debug(
-                "Completed orchestrated operation '%s'", self._operation_name,
+                "Completed orchestrated operation '%s'",
+                self._operation_name,
                 extra={"operation": self._operation_name},
             )
             return False
@@ -131,7 +138,9 @@ class TransactionContext:
         for compensation in reversed(self._compensations):
             try:
                 compensation()
-            except Exception:  # noqa: BLE001 - a failed compensation must not mask the original error
+            except (
+                Exception
+            ):  # noqa: BLE001 - a failed compensation must not mask the original error
                 self._logger.error(
                     "Compensating action failed during rollback of '%s'",
                     self._operation_name,
@@ -141,7 +150,9 @@ class TransactionContext:
         return False  # never suppress the triggering exception
 
 
-def map_workflow_definition_record_to_domain(record: WorkflowDefinitionRecord) -> WorkflowDefinition:
+def map_workflow_definition_record_to_domain(
+    record: WorkflowDefinitionRecord,
+) -> WorkflowDefinition:
     """Map a persistence-level ``WorkflowDefinitionRecord`` into its Domain
     Layer ``WorkflowDefinition`` representation.
 
@@ -258,7 +269,7 @@ class WorkflowDefinitionService:
             existing_versions = [
                 d.version
                 for d in self._workflow_definition_repo.list_definitions(
-                    request_type=request_type, page=Page(size=100)
+                    request_type=request_type, company_id=identity.company_id, page=Page(size=100)
                 ).items
             ]
         except DatabaseError as exc:
@@ -272,6 +283,7 @@ class WorkflowDefinitionService:
                 version=next_version,
                 definition=document.model_dump(mode="json"),
                 created_by=identity.user_id,
+                company_id=identity.company_id,
             )
         except DatabaseError as exc:
             raise translate_database_error(exc) from exc
@@ -320,7 +332,15 @@ class WorkflowDefinitionService:
             raise translate_auth_error(exc) from exc
 
         try:
-            existing = self._workflow_definition_repo.get_by_id(definition_id)
+            # get_by_id_for_company reports a different company's
+            # definition exactly as not-found, never a permission
+            # failure, matching this codebase's established convention
+            # for cross-tenant/cross-owner access elsewhere (e.g.
+            # authorize_request_view) — enforced structurally by the
+            # repository itself, not by a manual check here.
+            existing = self._workflow_definition_repo.get_by_id_for_company(
+                definition_id, company_id=identity.company_id
+            )
         except RecordNotFoundError as exc:
             raise translate_database_error(exc) from exc
 
@@ -343,7 +363,8 @@ class WorkflowDefinitionService:
             raise translate_database_error(exc) from exc
 
         self._logger.info(
-            "Updated draft workflow definition %s", definition_id,
+            "Updated draft workflow definition %s",
+            definition_id,
             extra={"definition_id": str(definition_id)},
         )
         return map_workflow_definition_record_to_domain(updated)
@@ -386,12 +407,14 @@ class WorkflowDefinitionService:
             raise translate_auth_error(exc) from exc
 
         try:
-            candidate = self._workflow_definition_repo.get_by_id(definition_id)
+            candidate = self._workflow_definition_repo.get_by_id_for_company(
+                definition_id, company_id=identity.company_id
+            )
         except RecordNotFoundError as exc:
             raise translate_database_error(exc) from exc
 
         currently_active_record = self._workflow_definition_repo.find_active_for_request_type(
-            candidate.request_type
+            candidate.request_type, company_id=identity.company_id
         )
         candidate_domain = map_workflow_definition_record_to_domain(candidate)
         currently_active_domain = (
@@ -413,6 +436,7 @@ class WorkflowDefinitionService:
                     definition_id,
                     request_type=candidate.request_type,
                     expected_row_version=candidate.row_version,
+                    company_id=identity.company_id,
                 )
             except DatabaseError as exc:
                 raise translate_database_error(exc) from exc
@@ -483,7 +507,10 @@ class WorkflowDefinitionService:
 
         try:
             result = self._workflow_definition_repo.list_definitions(
-                request_type=request_type, is_active=is_active_filter, page=page
+                request_type=request_type,
+                company_id=identity.company_id,
+                is_active=is_active_filter,
+                page=page,
             )
         except DatabaseError as exc:
             raise translate_database_error(exc) from exc
@@ -496,20 +523,69 @@ class WorkflowDefinitionService:
         )
 
     @log_calls()
-    def get_active_version(self, request_type: str) -> WorkflowDefinition:
+    def search_definitions(
+        self,
+        identity: AuthenticatedIdentity,
+        query_text: str,
+        *,
+        page: Page = Page(),
+    ) -> PagedResult[WorkflowDefinition]:
+        """Free-text search across request types, unlike ``list_versions``
+        (which requires an exact, already-known request type).
+
+        Used by ``GlobalSearchService``. Applies the identical
+        active-only restriction ``list_versions`` already applies to a
+        non-administrator (API-ADD Section 19.9.4).
+
+        Args:
+            identity: The authenticated caller.
+            query_text: The search term.
+            page: The page to retrieve.
+
+        Returns:
+            A ``PagedResult`` of matching ``WorkflowDefinition`` instances.
+
+        Raises:
+            ValidationError: If ``query_text`` is empty.
+        """
+        from app.models.enums import UserRole  # local import avoids a module-level cycle risk
+
+        is_active_filter: bool | None = None
+        if identity.role is not UserRole.ADMIN:
+            is_active_filter = True
+
+        try:
+            result = self._workflow_definition_repo.search_definitions(
+                query_text, company_id=identity.company_id, is_active=is_active_filter, page=page
+            )
+        except DatabaseError as exc:
+            raise translate_database_error(exc) from exc
+
+        return PagedResult(
+            items=[map_workflow_definition_record_to_domain(r) for r in result.items],
+            page=result.page,
+            page_size=result.page_size,
+            total_records=result.total_records,
+        )
+
+    @log_calls()
+    def get_active_version(self, request_type: str, *, company_id: UUID) -> WorkflowDefinition:
         """Fetch the currently active workflow definition for a request type.
 
         Args:
             request_type: The request type to resolve.
+            company_id: The company (tenant) to resolve within.
 
         Returns:
             The active ``WorkflowDefinition``.
 
         Raises:
             NotFoundError: If no active definition exists for
-                ``request_type``.
+                ``request_type`` within this company.
         """
-        record = self._workflow_definition_repo.find_active_for_request_type(request_type)
+        record = self._workflow_definition_repo.find_active_for_request_type(
+            request_type, company_id=company_id
+        )
         if record is None:
             raise NotFoundError("workflow_definition (active)", request_type)
         return map_workflow_definition_record_to_domain(record)
@@ -554,11 +630,7 @@ class WorkflowDefinitionService:
             self._workflow_engine.validate_definition_assignees(document, frozenset())
             return
 
-        found_ids: set[UUID] = set()
-        for user_id in referenced_ids:
-            profile = self._profile_repo.find_by_id(user_id)
-            if profile is not None:
-                found_ids.add(user_id)
+        found_ids = {profile.id for profile in self._profile_repo.find_by_ids(list(referenced_ids))}
 
         try:
             self._workflow_engine.validate_definition_assignees(document, frozenset(found_ids))

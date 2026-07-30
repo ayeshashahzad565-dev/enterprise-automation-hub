@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 
 from app.auth.exceptions import PermissionDeniedError, RoleNotPermittedError
-from app.auth.permissions import Permission, ROLE_PERMISSIONS
+from app.auth.permissions import ROLE_PERMISSIONS, Permission
 from app.models.enums import UserRole
 
 __all__ = [
@@ -103,9 +103,7 @@ def require_role(role: UserRole, *allowed_roles: UserRole) -> None:
         raise RoleNotPermittedError(role.value, tuple(r.value for r in allowed_roles))
 
 
-def can_view_request(
-    role: UserRole, *, is_requester: bool, is_assigned_approver: bool
-) -> bool:
+def can_view_request(role: UserRole, *, is_requester: bool, is_assigned_approver: bool) -> bool:
     """Return whether a caller may view a specific request.
 
     Matches DSD Section 9.2's RLS policy table: the requester, an
@@ -151,9 +149,7 @@ def can_edit_request(role: UserRole, *, is_requester: bool, request_is_pending: 
     return is_requester and request_is_pending
 
 
-def can_withdraw_request(
-    role: UserRole, *, is_requester: bool, request_is_pending: bool
-) -> bool:
+def can_withdraw_request(role: UserRole, *, is_requester: bool, request_is_pending: bool) -> bool:
     """Return whether a caller may withdraw (soft-delete) a request.
 
     Matches API-ADD Section 19.3.5: "Requester, only while status =
@@ -218,9 +214,7 @@ def can_moderate_comment(role: UserRole) -> bool:
     return role is UserRole.ADMIN
 
 
-def can_remove_attachment(
-    role: UserRole, *, is_uploader: bool, request_is_pending: bool
-) -> bool:
+def can_remove_attachment(role: UserRole, *, is_uploader: bool, request_is_pending: bool) -> bool:
     """Return whether a caller may remove an attachment.
 
     Matches API-ADD Section 19.7.4: "The original uploader (while the
@@ -256,9 +250,7 @@ def can_manage_workflow_definitions(role: UserRole) -> bool:
     return role is UserRole.ADMIN
 
 
-def can_view_audit_trail(
-    role: UserRole, *, is_requester: bool, is_assigned_approver: bool
-) -> bool:
+def can_view_audit_trail(role: UserRole, *, is_requester: bool, is_assigned_approver: bool) -> bool:
     """Return whether a caller may view a request's audit trail.
 
     Matches API-ADD Section 19.10.1: "Same visibility as the parent

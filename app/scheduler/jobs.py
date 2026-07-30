@@ -18,11 +18,10 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Iterator
-from uuid import uuid4
+from uuid import UUID
 
-from app.database.exceptions import DatabaseError, RecordNotFoundError
 from app.database.repositories.approval_repository import ApprovalRepository
 from app.database.repositories.base_repository import Page
 from app.database.repositories.request_repository import RequestRecord, RequestRepository
@@ -30,14 +29,19 @@ from app.database.repositories.workflow_repository import (
     WorkflowDefinitionRepository,
     WorkflowStageRecord,
 )
-from app.models import StageDefinition
+from app.models import StageDefinition, WorkflowDefinition
+from app.scheduler.interfaces import ExecutionContext, ExecutionResult
 from app.services.workflow_definition_service import map_workflow_definition_record_to_domain
 from app.utils.datetime_utils import utc_now
 from app.workflow.exceptions import StageNotFoundInDefinitionError
 
-from app.scheduler.interfaces import ExecutionContext, ExecutionResult
-
-__all__ = ["BaseJob", "StageContext", "ItemBatchResult", "iter_pending_stages", "load_stage_context"]
+__all__ = [
+    "BaseJob",
+    "StageContext",
+    "ItemBatchResult",
+    "iter_pending_stages",
+    "load_stage_context",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -194,11 +198,11 @@ def run_over_items(items, action, *, job_logger: logging.Logger) -> ItemBatchRes
     for item in items:
         try:
             action(item)
-        except Exception as exc:  # noqa: BLE001 - intentional: one item's failure must not abort the batch
+        except (
+            Exception
+        ) as exc:  # noqa: BLE001 - intentional: one item's failure must not abort the batch
             failed += 1
-            job_logger.warning(
-                "Failed to process item %r: %s", item, exc, exc_info=exc
-            )
+            job_logger.warning("Failed to process item %r: %s", item, exc, exc_info=exc)
         else:
             processed += 1
     return ItemBatchResult(processed_count=processed, failed_count=failed)
@@ -239,7 +243,7 @@ def iter_pending_stages(
     cutoff = utc_now()
     page_number = 1
     while page_number <= max_pages:
-        result = approval_repo.list_overdue_stages(
+        result = approval_repo.list_overdue_stages_all_companies(
             created_before=cutoff, page=Page(number=page_number, size=page_size)
         )
         if not result.items:
@@ -273,6 +277,7 @@ def load_stage_context(
     *,
     request_repo: RequestRepository,
     workflow_definition_repo: WorkflowDefinitionRepository,
+    definition_cache: dict[UUID, WorkflowDefinition] | None = None,
 ) -> StageContext:
     """Resolve a stage's parent request and its own workflow definition entry.
 
@@ -280,6 +285,16 @@ def load_stage_context(
         stage: The stage to resolve context for.
         request_repo: Persistence for ``requests``.
         workflow_definition_repo: Persistence for ``workflow_definitions``.
+        definition_cache: An optional, caller-owned cache of already-
+            resolved workflow definitions, keyed by
+            ``workflow_definition_id``. A single job run typically
+            considers many stages that share the same handful of pinned
+            definitions (one per request type/version in active use) —
+            passing the same dict across every ``load_stage_context``
+            call within one job execution (``EscalationJob``/
+            ``ReminderJob`` both do this) avoids re-fetching an
+            already-seen definition. ``None`` (the default) preserves
+            this function's original, uncached, always-fetch behavior.
 
     Returns:
         The resolved ``StageContext``.
@@ -294,8 +309,15 @@ def load_stage_context(
             operating production code.
     """
     request = request_repo.get_by_id(stage.request_id)
-    definition_record = workflow_definition_repo.get_by_id(request.workflow_definition_id)
-    definition_domain = map_workflow_definition_record_to_domain(definition_record)
+
+    cached = definition_cache.get(request.workflow_definition_id) if definition_cache else None
+    if cached is not None:
+        definition_domain = cached
+    else:
+        definition_record = workflow_definition_repo.get_by_id(request.workflow_definition_id)
+        definition_domain = map_workflow_definition_record_to_domain(definition_record)
+        if definition_cache is not None:
+            definition_cache[request.workflow_definition_id] = definition_domain
 
     matching = [
         stage_def

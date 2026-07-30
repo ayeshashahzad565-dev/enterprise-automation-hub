@@ -23,8 +23,9 @@ module in this package that knows how to combine an
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Protocol
 
 from app.auth import authorization
 from app.auth.authentication import AuthenticatedIdentity, extract_bearer_token

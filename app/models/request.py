@@ -117,14 +117,12 @@ class RequestUpdate(PartialUpdateModel):
     department: str | None = None
 
     @model_validator(mode="after")
-    def _require_at_least_one_field(self) -> "RequestUpdate":
+    def _require_at_least_one_field(self) -> RequestUpdate:
         """Reject a patch payload that sets no field at all.
 
         Raises:
             EmptyUpdatePayloadError: If no field was explicitly provided.
         """
         if not self.has_updates():
-            raise EmptyUpdatePayloadError(
-                "RequestUpdate requires at least one field to update."
-            )
+            raise EmptyUpdatePayloadError("RequestUpdate requires at least one field to update.")
         return self

@@ -23,6 +23,13 @@ This package contains:
 - ``escalation_job``: the Escalation Check job (WEDD Section 8.3).
 - ``reminder_job``: the Reminder Dispatch job (WEDD Section 8.3).
 - ``health_check_job``: the in-memory scheduler health reporting job.
+- ``distributed_lock``: ``DistributedLock``, the protocol both
+  ``leader_election`` and ``SchedulerCoordinator``'s per-job execution
+  locking depend on, plus ``RedisDistributedLock`` and
+  ``NullDistributedLock`` (see ``docs/scheduler_distributed_coordination.md``).
+- ``leader_election``: ``LeaderElection``, Redis-backed dynamic leadership
+  for multi-instance deployments — self-healing, replacing the purely
+  static ``SCHEDULER_LEADER`` designation when Redis is configured.
 - ``scheduler``: ``SchedulerCoordinator``, the single entry point tying
   every component above together, and ``APSchedulerBackend``, the
   default APScheduler-backed ``SchedulerBackend`` implementation.
@@ -35,11 +42,18 @@ can import from ``app.scheduler`` directly.
 
 from __future__ import annotations
 
+from app.scheduler.distributed_lock import (
+    DistributedLock,
+    NullDistributedLock,
+    RedisDistributedLock,
+)
 from app.scheduler.escalation_job import EscalationJob
 from app.scheduler.exceptions import (
     JobAlreadyRunningError,
     JobExecutionError,
+    JobLockedElsewhereError,
     JobRegistrationError,
+    NotLeaderError,
     SchedulerError,
     SchedulerShutdownError,
     SchedulerStartupError,
@@ -54,18 +68,31 @@ from app.scheduler.interfaces import (
     SchedulerBackend,
     SchedulerStatisticsProvider,
 )
-from app.scheduler.jobs import BaseJob, ItemBatchResult, StageContext, iter_pending_stages, load_stage_context
+from app.scheduler.jobs import (
+    BaseJob,
+    ItemBatchResult,
+    StageContext,
+    iter_pending_stages,
+    load_stage_context,
+)
+from app.scheduler.leader_election import LeaderElection
 from app.scheduler.registry import JobRegistration, JobRegistry
 from app.scheduler.reminder_job import ReminderJob
 from app.scheduler.scheduler import APSchedulerBackend, SchedulerCoordinator
 
 __all__ = [
+    # distributed_lock
+    "DistributedLock",
+    "NullDistributedLock",
+    "RedisDistributedLock",
     # escalation_job
     "EscalationJob",
     # exceptions
     "JobAlreadyRunningError",
     "JobExecutionError",
+    "JobLockedElsewhereError",
     "JobRegistrationError",
+    "NotLeaderError",
     "SchedulerError",
     "SchedulerShutdownError",
     "SchedulerStartupError",
@@ -87,6 +114,8 @@ __all__ = [
     "StageContext",
     "iter_pending_stages",
     "load_stage_context",
+    # leader_election
+    "LeaderElection",
     # registry
     "JobRegistration",
     "JobRegistry",

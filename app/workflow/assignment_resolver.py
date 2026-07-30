@@ -21,8 +21,8 @@ practical stand-in for "the requester's manager."
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Sequence
 from uuid import UUID
 
 from app.models import Profile, StageDefinition
@@ -191,9 +191,7 @@ class AssignmentResolver:
                 chosen.id,
                 requester.department,
             )
-            return AssignmentResult(
-                assigned_to=chosen.id, assigned_role=None, used_fallback=False
-            )
+            return AssignmentResult(assigned_to=chosen.id, assigned_role=None, used_fallback=False)
 
         logger.warning(
             "No department-designated approver found for requester department=%s; "

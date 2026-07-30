@@ -1,0 +1,57 @@
+# Local Supabase CLI stack — used only to run the Playwright E2E suite
+# (frontend/e2e/) and, locally, the real-database backend integration
+# suite (tests/integration/, see its README) against a real, ephemeral
+# Postgres + GoTrue Auth stack. Never used for production; `supabase
+# start` prints fixed local development keys that are only ever valid
+# against this ephemeral local instance, never a secret.
+#
+# Every other Supabase service this project doesn't use is disabled
+# below to keep `supabase start` fast and CI-friendly: file storage,
+# Realtime, the Studio dashboard, Edge Functions, and the local email
+# inbox (Inbucket) are all unused — password-based login needs only
+# `db` + `auth` + `api`, and this application's own invitation emails go
+# through its own SMTP configuration, never Supabase's.
+project_id = "enterprise-automation-hub"
+
+[api]
+enabled = true
+port = 54321
+schemas = ["public", "storage", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+major_version = 15
+
+[studio]
+enabled = false
+
+[inbucket]
+enabled = false
+
+[storage]
+enabled = false
+
+[realtime]
+enabled = false
+
+[edge_runtime]
+enabled = false
+
+[auth]
+enabled = true
+# Matches the frontend's local dev origin (frontend/.env.local.example,
+# NEXT_PUBLIC_API_BASE_URL's sibling); only used for building auth
+# redirect links this app's password-only login flow never triggers.
+site_url = "http://127.0.0.1:3000"
+additional_redirect_urls = ["http://127.0.0.1:3000"]
+jwt_expiry = 3600
+enable_signup = false
+
+[auth.email]
+enable_signup = false
+enable_confirmations = false
+
+[auth.sms]
+enable_signup = false

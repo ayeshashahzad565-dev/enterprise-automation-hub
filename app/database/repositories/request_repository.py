@@ -2,17 +2,18 @@
 
 Per DSD Section 3.3, ``requests`` is the central entity of the system — a
 single business request submitted by an employee and tracked through to
-completion. This module defines the ``RequestStatus`` enum (imported
-elsewhere in this package wherever a request's lifecycle status needs to
-be referenced) and the ``RequestRepository`` class.
+completion. ``RequestStatus`` is re-exported here from
+``app.models.enums`` (the single canonical definition, per DSD Section
+1.5) purely for backward compatibility with existing call sites that
+import it from this module, as well as the ``RequestRepository`` class.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum
 from typing import Any
 from uuid import UUID
 
@@ -22,27 +23,16 @@ from app.database.repositories.base_repository import (
     BaseRepository,
     Page,
     PagedResult,
+    escape_ilike_special_characters,
     parse_datetime,
     parse_uuid,
+    quote_postgrest_filter_value,
 )
+from app.models.enums import RequestStatus
 
 logger = logging.getLogger(__name__)
 
-
-class RequestStatus(str, Enum):
-    """The five values fixed by DSD Section 1.5's ``request_status`` enum.
-
-    ``APPROVED`` is reserved for forward compatibility (WEDD Section 20.1)
-    and is not reachable through any code path in the current baseline —
-    ``COMPLETED`` is the terminal "approved" state a request actually
-    reaches.
-    """
-
-    PENDING = "pending"
-    IN_REVIEW = "in_review"
-    APPROVED = "approved"
-    REJECTED = "rejected"
-    COMPLETED = "completed"
+__all__ = ["RequestStatus", "RequestRecord", "RequestRepository"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +60,8 @@ class RequestRecord:
         created_at: Submission timestamp.
         updated_at: Last modification timestamp.
         completed_at: Timestamp of final approval, rejection, or completion.
+        company_id: The company (tenant) this request belongs to,
+            denormalized from the requester at creation time.
     """
 
     id: UUID
@@ -87,6 +79,7 @@ class RequestRecord:
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None
+    company_id: UUID
 
 
 def _map_request_row(row: dict[str, Any]) -> RequestRecord:
@@ -107,6 +100,7 @@ def _map_request_row(row: dict[str, Any]) -> RequestRecord:
         created_at=parse_datetime(row["created_at"]),  # type: ignore[arg-type]
         updated_at=parse_datetime(row["updated_at"]),  # type: ignore[arg-type]
         completed_at=parse_datetime(row.get("completed_at")),
+        company_id=parse_uuid(row["company_id"]),  # type: ignore[arg-type]
     )
 
 
@@ -114,18 +108,29 @@ class RequestRepository(BaseRepository[RequestRecord]):
     """Persistence operations for the ``requests`` table.
 
     Corresponds to ``RequestService``'s persistence needs described in the
-    ADD and WEDD Section 5. Row-Level Security (DSD Section 9.2) is relied
-    upon to scope which rows a given anon-key client can see; this
-    repository applies only the structural filters a caller explicitly
-    requests (status, type, department, date range), never an implicit
-    "only my own rows" filter, since that scoping is the database's job,
-    not this class's.
+    ADD and WEDD Section 5.
+
+    This table's Row-Level Security policies (DSD Section 9.2) are
+    correctly written, but this repository deliberately stays on the
+    service-role client (``always_use_injected_client=True``, see
+    ``docs/tenant_isolation.md``) rather than the per-request, RLS-
+    enforcing client: the approval flow updates a request's stage as the
+    *approver*, not the requester, which the requester-or-admin-only
+    update policy does not permit. Visibility/authorization scoping
+    (requester/approver/admin role, and always company membership) is
+    therefore performed entirely in the Application Layer
+    (``RequestService``), which passes the resulting explicit filters
+    (``company_id``, ``requester_id``, ``request_ids``) into this
+    repository's methods — this class applies only the structural filters
+    a caller explicitly requests, never an implicit "only my own rows"
+    filter, but that is a statement about this class's own scope, not a
+    claim that the database enforces the rest.
     """
 
     table_name = "requests"
 
-    def __init__(self, client: DatabaseClient) -> None:
-        super().__init__(client)
+    def __init__(self, client: DatabaseClient, *, always_use_injected_client: bool) -> None:
+        super().__init__(client, always_use_injected_client=always_use_injected_client)
 
     def get_by_id(self, request_id: UUID) -> RequestRecord:  # type: ignore[override]
         """Fetch a request by its id.
@@ -153,6 +158,7 @@ class RequestRepository(BaseRepository[RequestRecord]):
         workflow_definition_id: UUID,
         request_type: str,
         title: str,
+        company_id: UUID,
         description: str | None = None,
         department: str | None = None,
     ) -> RequestRecord:
@@ -174,6 +180,9 @@ class RequestRepository(BaseRepository[RequestRecord]):
             request_type: The request type identifier.
             title: Short human-readable summary (1-200 characters,
                 validated at the Domain Layer, not here).
+            company_id: The company (tenant) this request belongs to —
+                always the caller's own ``identity.company_id``, never
+                client input.
             description: Full request details, if provided.
             department: Department the request was raised under, if
                 provided.
@@ -196,6 +205,7 @@ class RequestRepository(BaseRepository[RequestRecord]):
             "description": description,
             "department": department,
             "status": RequestStatus.PENDING.value,
+            "company_id": str(company_id),
         }
         return self.insert(values, mapper=_map_request_row)
 
@@ -223,7 +233,15 @@ class RequestRepository(BaseRepository[RequestRecord]):
             status: The new lifecycle status.
             completed_at: The completion timestamp, required when
                 ``status`` is a terminal value (``COMPLETED`` or
-                ``REJECTED``); ``None`` otherwise.
+                ``REJECTED``); ``None`` otherwise. Always written
+                explicitly (including ``None``, which clears the column)
+                rather than only when truthy — every forward transition
+                that omits it does so on a row where it is already
+                ``None``, so this is a no-op for them, but it is exactly
+                what lets ``ApprovalService``'s compensating calls put a
+                terminal transition's ``completed_at`` back to ``None``
+                on rollback, not merely leave whatever the forward call
+                set.
 
         Returns:
             The updated ``RequestRecord``.
@@ -235,9 +253,8 @@ class RequestRepository(BaseRepository[RequestRecord]):
         values: dict[str, Any] = {
             "current_stage_id": str(current_stage_id) if current_stage_id else None,
             "status": status.value,
+            "completed_at": completed_at.isoformat() if completed_at is not None else None,
         }
-        if completed_at is not None:
-            values["completed_at"] = completed_at.isoformat()
         return self.update_with_optimistic_lock(
             request_id,
             expected_version=expected_version,
@@ -284,9 +301,7 @@ class RequestRepository(BaseRepository[RequestRecord]):
         if department is not None:
             values["department"] = department
         if not values:
-            raise InvalidQueryError(
-                "update_editable_fields requires at least one field to update."
-            )
+            raise InvalidQueryError("update_editable_fields requires at least one field to update.")
         return self.update_with_optimistic_lock(
             request_id,
             expected_version=expected_version,
@@ -333,10 +348,12 @@ class RequestRepository(BaseRepository[RequestRecord]):
     def list_requests(
         self,
         *,
+        company_id: UUID,
         status: RequestStatus | None = None,
         request_type: str | None = None,
         department: str | None = None,
         requester_id: UUID | None = None,
+        request_ids: Sequence[UUID] | None = None,
         created_after: datetime | None = None,
         created_before: datetime | None = None,
         include_deleted: bool = False,
@@ -345,11 +362,14 @@ class RequestRepository(BaseRepository[RequestRecord]):
     ) -> PagedResult[RequestRecord]:
         """List requests matching the given structural filters.
 
-        Visibility scoping by requester/approver/admin role is performed
-        entirely by Row-Level Security on the underlying connection (DSD
-        Section 9.2) — this method applies only the explicit filters
-        passed in, corresponding to the query parameters documented in
-        API-ADD Section 13.
+        This repository stays on the service-role client (see the class
+        docstring), so RLS-based visibility scoping by requester/approver/
+        admin role does not apply here — this method applies only the
+        explicit filters passed in, corresponding to the query parameters
+        documented in API-ADD Section 13, and ``RequestService``
+        additionally computes and passes ``requester_id``/``request_ids``
+        explicitly for the roles that need it (defense-in-depth, matching
+        the discipline already applied throughout this package).
 
         Args:
             status: Restrict to this lifecycle status, if provided.
@@ -357,6 +377,9 @@ class RequestRepository(BaseRepository[RequestRecord]):
             department: Restrict to this department, if provided.
             requester_id: Restrict to requests submitted by this user, if
                 provided.
+            request_ids: Restrict to exactly this set of request ids, if
+                provided — used to scope an approver's view to requests
+                with a stage assigned to them, computed by the caller.
             created_after: Restrict to requests created at or after this
                 timestamp, if provided.
             created_before: Restrict to requests created at or before this
@@ -374,7 +397,7 @@ class RequestRepository(BaseRepository[RequestRecord]):
         Returns:
             A ``PagedResult`` of matching requests.
         """
-        builder = self._query()
+        builder = self._scoped_query(company_id=company_id)
         if status is not None:
             builder = builder.eq("status", status.value)
         if request_type is not None:
@@ -383,6 +406,8 @@ class RequestRepository(BaseRepository[RequestRecord]):
             builder = builder.eq("department", department)
         if requester_id is not None:
             builder = builder.eq("requester_id", str(requester_id))
+        if request_ids is not None:
+            builder = builder.in_("id", [str(i) for i in request_ids])
         if created_after is not None:
             builder = builder.gte("created_at", created_after.isoformat())
         if created_before is not None:
@@ -396,6 +421,9 @@ class RequestRepository(BaseRepository[RequestRecord]):
         self,
         query_text: str,
         *,
+        company_id: UUID,
+        requester_id: UUID | None = None,
+        request_ids: Sequence[UUID] | None = None,
         include_deleted: bool = False,
         page: Page = Page(),
     ) -> PagedResult[RequestRecord]:
@@ -406,9 +434,39 @@ class RequestRepository(BaseRepository[RequestRecord]):
         operation as ``list_requests`` with a text filter rather than a
         separate resource.
 
+        Matches either a literal substring (``ILIKE``, backed by the
+        ``requests_title_trgm_idx``/``requests_description_trgm_idx``
+        trigram indexes from ``0018_search_indexes``) or a stemmed word
+        via the generated ``search_vector`` column (backed by
+        ``requests_search_vector_idx``) — so, e.g., a query for "run"
+        also matches a description containing "running", which substring
+        matching alone would miss.
+
+        Per Milestone 9's Search/Filter Injection audit: ``query_text``
+        is escaped via ``escape_ilike_special_characters`` (literal
+        ``%``/``_`` matching) and the resulting pattern is quoted via
+        ``quote_postgrest_filter_value`` before being interpolated into
+        the ``.or_()`` combined-filter string below — this repository
+        runs on the service-role client (bypasses RLS), so an unescaped,
+        unquoted ``query_text`` containing a comma/period/parenthesis
+        could otherwise restructure the filter expression itself, not
+        merely produce an unexpected substring match. The raw (unescaped)
+        ``query_text`` is used for the ``search_vector`` clause instead —
+        ``websearch_to_tsquery`` parses its own syntax (quoted phrases,
+        ``-``/``or``), not ``ILIKE`` wildcards — but is still quoted via
+        ``quote_postgrest_filter_value`` for the same filter-string-safety
+        reason.
+
         Args:
             query_text: The search term. Matched case-insensitively
                 against both ``title`` and ``description``.
+            requester_id: Restrict to requests submitted by this user, if
+                provided — applied as a query predicate (not a post-hoc
+                Python filter) so pagination and ``total_records`` stay
+                correct for a scoped caller.
+            request_ids: Restrict to exactly this set of request ids, if
+                provided — used to scope an approver's search to requests
+                with a stage assigned to them, computed by the caller.
             include_deleted: Whether to include soft-deleted requests.
             page: The page to retrieve.
 
@@ -420,8 +478,17 @@ class RequestRepository(BaseRepository[RequestRecord]):
         """
         if not query_text or not query_text.strip():
             raise InvalidQueryError("search_requests requires a non-empty query_text.")
-        pattern = f"%{query_text.strip()}%"
-        builder = self._query().or_(f"title.ilike.{pattern},description.ilike.{pattern}")
+        pattern = f"%{escape_ilike_special_characters(query_text.strip())}%"
+        quoted_pattern = quote_postgrest_filter_value(pattern)
+        quoted_query = quote_postgrest_filter_value(query_text.strip())
+        builder = self._scoped_query(company_id=company_id).or_(
+            f"title.ilike.{quoted_pattern},description.ilike.{quoted_pattern},"
+            f"search_vector.wfts(english).{quoted_query}"
+        )
+        if requester_id is not None:
+            builder = builder.eq("requester_id", str(requester_id))
+        if request_ids is not None:
+            builder = builder.in_("id", [str(i) for i in request_ids])
         if not include_deleted:
             builder = builder.is_("deleted_at", "null")
         builder = builder.order("created_at", desc=True)

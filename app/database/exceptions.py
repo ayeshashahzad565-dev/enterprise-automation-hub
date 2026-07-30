@@ -164,3 +164,30 @@ class InvalidQueryError(DatabaseError):
     keep the query bounded and index-backed per DSD Section 10), rather
     than allowing an unbounded or malformed query to reach Supabase.
     """
+
+
+class StorageError(DatabaseError):
+    """Raised when a Supabase Storage operation (upload, download, remove,
+    or signed-URL generation) fails.
+
+    Supabase Storage is a distinct subsystem from the PostgREST-backed
+    tables every other repository in this package operates on — its
+    Python SDK (``storage3``) raises its own ``StorageApiError``, not a
+    Postgrest/PostgreSQL exception, so it cannot be translated by
+    ``BaseRepository._translate_and_raise``. ``AttachmentStorageGateway``
+    is the sole place a raw ``storage3`` exception is caught and
+    translated into this type, exactly mirroring the role
+    ``BaseRepository`` plays for every table-backed repository — no
+    caller outside ``app.database`` ever needs to catch a raw
+    third-party Storage exception type.
+
+    Attributes:
+        bucket: The Storage bucket the operation was attempted against.
+        path: The object path (or paths, joined, for a bulk operation)
+            the operation was attempted against.
+    """
+
+    def __init__(self, message: str, *, bucket: str, path: str) -> None:
+        super().__init__(message, details={"bucket": bucket, "path": path})
+        self.bucket = bucket
+        self.path = path

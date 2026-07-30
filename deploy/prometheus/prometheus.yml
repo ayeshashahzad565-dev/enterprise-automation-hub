@@ -1,0 +1,26 @@
+# Prometheus scrape configuration for the Enterprise Automation Hub.
+# Mounted read-only into the `prometheus` service by
+# docker-compose.production.yml.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "eah-backend"
+    static_configs:
+      - targets: ["backend:8000"]
+    metrics_path: /metrics
+
+  # Worker-local job-system metrics (jobs processed, duration, worker-up)
+  # — each worker-default/worker-escalation container runs its own tiny
+  # Prometheus HTTP server (WORKER_METRICS_PORT) since workers have no
+  # other HTTP server; see app.observability.metrics's module comment.
+  - job_name: "eah-worker"
+    static_configs:
+      - targets: ["worker-default:9100", "worker-escalation:9100"]
+    metrics_path: /metrics
+
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]

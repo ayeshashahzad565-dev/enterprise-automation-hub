@@ -145,9 +145,7 @@ def verify_password(password: str, encoded_hash: str) -> bool:
     except ValueError:
         return False
 
-    candidate_key = hashlib.pbkdf2_hmac(
-        _HASH_ALGORITHM, password.encode("utf-8"), salt, iterations
-    )
+    candidate_key = hashlib.pbkdf2_hmac(_HASH_ALGORITHM, password.encode("utf-8"), salt, iterations)
     # Constant-time comparison to avoid leaking information about how
     # much of the derived key matched via a timing side channel.
     return hmac.compare_digest(candidate_key, expected_key)

@@ -24,6 +24,16 @@ from app.database.repositories.analytics_repository import (
 from app.database.repositories.approval_repository import ApprovalRepository
 from app.database.repositories.audit_repository import AuditLogRecord, AuditRepository
 from app.database.repositories.base_repository import Page, PagedResult
+from app.database.repositories.invitation_repository import (
+    InvitationRecord,
+    InvitationRepository,
+    InvitationStatus,
+)
+from app.database.repositories.job_repository import JobRecord, JobRepository
+from app.database.repositories.notification_preference_repository import (
+    NotificationPreferenceRecord,
+    NotificationPreferenceRepository,
+)
 from app.database.repositories.notification_repository import (
     NotificationRecord,
     NotificationRepository,
@@ -34,7 +44,7 @@ from app.database.repositories.request_repository import (
     RequestRepository,
     RequestStatus,
 )
-from app.database.repositories.user_repository import ProfileRepository, ProfileRecord, UserRole
+from app.database.repositories.user_repository import ProfileRecord, ProfileRepository, UserRole
 from app.database.repositories.workflow_repository import (
     StageStatus,
     WorkflowDefinitionRecord,
@@ -49,6 +59,13 @@ __all__ = [
     "ApprovalThroughput",
     "AuditLogRecord",
     "AuditRepository",
+    "InvitationRecord",
+    "InvitationRepository",
+    "InvitationStatus",
+    "JobRecord",
+    "JobRepository",
+    "NotificationPreferenceRecord",
+    "NotificationPreferenceRepository",
     "NotificationRecord",
     "NotificationRepository",
     "NotificationType",

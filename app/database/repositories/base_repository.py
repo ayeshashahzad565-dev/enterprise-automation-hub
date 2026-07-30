@@ -16,12 +16,16 @@ into the typed exception hierarchy in ``app.database.exceptions``.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 from abc import ABC
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Callable, Generic, TypeVar
+from datetime import UTC, datetime
+from typing import Any, Generic, TypeVar
 from uuid import UUID
+
+import httpx
 
 from app.database.client import DatabaseClient
 from app.database.exceptions import (
@@ -30,6 +34,8 @@ from app.database.exceptions import (
     RecordNotFoundError,
     RepositoryError,
 )
+from app.utils.exceptions import RetryExhaustedError
+from app.utils.retry import RetryPolicy, retry_call
 
 try:  # pragma: no cover - defensive import guard for optional precise error codes
     from postgrest.exceptions import APIError as _PostgrestAPIError
@@ -52,6 +58,79 @@ _PG_UNIQUE_VIOLATION = "23505"
 _PG_FOREIGN_KEY_VIOLATION = "23503"
 _PG_CHECK_VIOLATION = "23514"
 _PG_NOT_NULL_VIOLATION = "23502"
+
+#: Transport-level failures only — the request never reached the server,
+#: or its response was lost in transit, distinct from any exception that
+#: means the server actually responded (constraint violation, etc.),
+#: which must never be retried here. postgrest-py (2.x) hardcodes
+#: ``http2=True`` on its internal httpx client with no supported way to
+#: disable it via the public API; a single dropped HTTP/2 stream can
+#: surface as ``RemoteProtocolError``/``ReadError`` on an otherwise-healthy
+#: connection. Implements the ADD's own Error Handling Strategy ("transient
+#: failures are retried a bounded number of times at the repository
+#: boundary"), which this method previously did not actually do.
+_TRANSIENT_TRANSPORT_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    httpx.TimeoutException,
+    httpx.ConnectError,
+    httpx.ReadError,
+    httpx.RemoteProtocolError,
+)
+
+_TRANSIENT_RETRY_POLICY = RetryPolicy(
+    max_attempts=3,
+    base_delay_seconds=0.25,
+    backoff_multiplier=2.0,
+    max_delay_seconds=2.0,
+    jitter=True,
+    retryable_exceptions=_TRANSIENT_TRANSPORT_EXCEPTIONS,
+)
+
+#: The current request's tenant-scoped, RLS-enforcing database client, if
+#: one has been bound. Set for the duration of a request by
+#: ``app.api.dependencies.bind_tenant_database_client`` (an async
+#: dependency, so the ``.set()`` below happens on the request's own
+#: event-loop task, before any sync/threadpooled code runs — a plain
+#: ``.set()`` made *inside* a sync dependency or endpoint would not
+#: propagate out, since FastAPI/Starlette dispatch sync code through a
+#: copied `contextvars.Context`). Left unset (``None``) outside an HTTP
+#: request — the Scheduler and background jobs never bind it, so
+#: ``BaseRepository._client`` transparently falls back to the
+#: constructor-injected default client for them, exactly as before this
+#: mechanism existed.
+_current_tenant_client: contextvars.ContextVar[DatabaseClient | None] = contextvars.ContextVar(
+    "_current_tenant_client", default=None
+)
+
+
+def bind_current_tenant_client(client: DatabaseClient) -> contextvars.Token[DatabaseClient | None]:
+    """Bind ``client`` as the current request's tenant-scoped database client.
+
+    The only intended caller is
+    ``app.api.dependencies.bind_tenant_database_client`` — an async
+    dependency, so this runs on the request's own event-loop task, before
+    any threadpooled sync code (see that dependency's docstring for why
+    that matters). ``_current_tenant_client`` itself stays module-private;
+    this function and ``reset_current_tenant_client`` are the only
+    supported way to affect it from outside this module.
+
+    Args:
+        client: The per-request, caller-scoped client to bind (typically
+            constructed via ``SupabaseClientFactory.create_user_scoped_client``).
+
+    Returns:
+        A token that must be passed to ``reset_current_tenant_client`` once
+        the request completes, to restore the prior (unset) value.
+    """
+    return _current_tenant_client.set(client)
+
+
+def reset_current_tenant_client(token: contextvars.Token[DatabaseClient | None]) -> None:
+    """Undo a prior ``bind_current_tenant_client`` call.
+
+    Args:
+        token: The token returned by the matching ``bind_current_tenant_client`` call.
+    """
+    _current_tenant_client.reset(token)
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,9 +155,7 @@ class Page:
         if self.number < 1:
             raise ValueError(f"Page.number must be >= 1, got {self.number}.")
         if not (1 <= self.size <= MAX_PAGE_SIZE):
-            raise ValueError(
-                f"Page.size must be between 1 and {MAX_PAGE_SIZE}, got {self.size}."
-            )
+            raise ValueError(f"Page.size must be between 1 and {MAX_PAGE_SIZE}, got {self.size}.")
 
     @property
     def offset(self) -> int:
@@ -143,7 +220,7 @@ def parse_datetime(value: str | datetime | None) -> datetime | None:
     if value is None:
         return None
     if isinstance(value, datetime):
-        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
@@ -161,6 +238,85 @@ def parse_uuid(value: str | UUID | None) -> UUID | None:
     if value is None:
         return None
     return value if isinstance(value, UUID) else UUID(str(value))
+
+
+def escape_ilike_special_characters(value: str) -> str:
+    """Escape ``%``, ``_``, and ``\\`` so ``value`` is matched literally by
+    a PostgreSQL ``ILIKE`` pattern rather than as a wildcard.
+
+    Per Milestone 9's Search/Filter Injection audit, this is the single
+    shared implementation of a fix originally written locally in
+    ``invitation_repository.py`` (the Milestone 1-5 cleanup pass) — every
+    repository below that builds a free-text ``ILIKE`` pattern from
+    caller-supplied text now imports this function rather than
+    re-implementing it, so the escaping rule is defined exactly once.
+
+    Without this, a search term containing a literal ``%`` or ``_``
+    (both valid, if unusual, characters — e.g. in an email local part or
+    a comment body) is silently reinterpreted by Postgres as "any
+    sequence of characters" / "any single character," causing a search
+    to match rows it should not (or fail to match ones it should) rather
+    than behaving predictably. ``\\`` is PostgreSQL's default
+    ``LIKE``/``ILIKE`` escape character, so a literal backslash in the
+    input must itself be escaped first, before ``%``/``_`` are escaped,
+    so the escaping sequences this function introduces are never
+    themselves reinterpreted.
+
+    Args:
+        value: The raw value to embed in an ``ILIKE`` pattern.
+
+    Returns:
+        ``value`` with ``\\``, ``%``, and ``_`` escaped for literal
+        matching. The caller is still responsible for adding its own,
+        intentional ``%`` wildcards around the result, if any.
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def quote_postgrest_filter_value(value: str) -> str:
+    """Quote and escape a value for safe embedding in a raw PostgREST
+    combined-filter expression string (``.or_()``/``.and_()``).
+
+    Per Milestone 9's Search/Filter Injection audit: unlike a plain
+    ``.ilike(column, value)``/``.eq(column, value)`` call — where the
+    underlying ``postgrest-py`` client accepts ``value`` as a genuine,
+    separately-encoded parameter — ``.or_()``/``.and_()`` take one raw,
+    caller-built string in PostgREST's own combined-filter syntax
+    (``column.op.value,column2.op2.value2``, with ``,``/``.``/``(``/``)``
+    as syntactically significant characters). A caller-supplied value
+    embedded in that string *unescaped* can break out of its intended
+    ``column.op.value`` clause and inject additional filter clauses —
+    the same class of risk as unescaped SQL string concatenation, though
+    still bounded to whatever columns/rows the issuing repository method
+    already queries (this application's repositories always run on the
+    service-role client, which bypasses RLS, so this is a real
+    authorization-relevant boundary, not just a data-shape nuisance —
+    see ``RequestRepository.search_requests``/
+    ``InvitationRepository.list_invitations``, the two call sites this
+    was fixed for).
+
+    PostgREST's documented escape hatch is to double-quote a filter
+    value that must contain one of those reserved characters, with any
+    embedded ``"``/``\\`` itself backslash-escaped — exactly what this
+    function does. Every caller is expected to apply
+    ``escape_ilike_special_characters`` *first* if the quoted value will
+    also be used as an ``ilike`` pattern, then wrap the result with this
+    function before interpolating it into a ``.or_()``/``.and_()`` string
+    — the two concerns are independent (Postgres's own ``ILIKE``
+    wildcard semantics vs. PostgREST's filter-string syntax) and both
+    apply simultaneously to a value embedded in an OR'd ``ilike`` clause.
+
+    Args:
+        value: The raw (or already ``ILIKE``-escaped) value to embed as
+            one filter clause's value in a ``.or_()``/``.and_()`` string.
+
+    Returns:
+        ``value`` wrapped in double quotes, with any embedded ``"`` or
+        ``\\`` backslash-escaped, safe to interpolate directly into a
+        combined-filter expression string.
+    """
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
 class BaseRepository(ABC, Generic[T]):
@@ -197,14 +353,40 @@ class BaseRepository(ABC, Generic[T]):
     #: in the DSD. Must be set by every concrete subclass.
     table_name: str
 
-    def __init__(self, client: DatabaseClient) -> None:
+    def __init__(self, client: DatabaseClient, *, always_use_injected_client: bool) -> None:
         """Initialize the repository with an injected database client.
 
         Args:
             client: Any object satisfying the ``DatabaseClient`` protocol.
                 Production code supplies a ``SupabaseDatabaseClient``
                 constructed via ``SupabaseClientFactory``; tests may
-                supply a lightweight fake (TSD Section 3.3).
+                supply a lightweight fake (TSD Section 3.3). Used as this
+                repository's *default* client — always used verbatim when
+                ``always_use_injected_client`` is ``True``, and used as the
+                fallback (outside an HTTP request, e.g. the Scheduler) when
+                it is ``False``.
+            always_use_injected_client: Required, no default, so every
+                concrete repository must make an explicit, conscious
+                choice rather than silently inheriting one:
+
+                - ``True`` for a repository whose table's Row-Level
+                  Security policy does not (yet) match how this codebase's
+                  service layer actually reads or writes it (for example,
+                  a cross-actor write, or a table with no ``INSERT`` grant
+                  for the ``authenticated`` role at all) — this
+                  repository's queries always run on ``client`` (typically
+                  the shared service-role client), unaffected by any
+                  per-request tenant-scoped client. Tenant isolation for
+                  these tables is enforced entirely in application code
+                  (see ``_scoped_query``), not RLS.
+                - ``False`` for a repository verified safe to run under
+                  the caller's own RLS context: it resolves the per-request
+                  tenant-scoped client bound by
+                  ``app.api.dependencies.bind_tenant_database_client`` when
+                  one is bound (a real HTTP request from an authenticated
+                  caller), falling back to ``client`` otherwise (the
+                  Scheduler, background jobs, or any code path outside a
+                  request — there is no "caller" to scope to).
 
         Raises:
             ValueError: If the concrete subclass did not set
@@ -215,14 +397,74 @@ class BaseRepository(ABC, Generic[T]):
             raise ValueError(
                 f"{self.__class__.__name__} must define a non-empty 'table_name' attribute."
             )
-        self._client = client
-        self._logger = logging.getLogger(
-            f"{self.__class__.__module__}.{self.__class__.__name__}"
-        )
+        self._default_client = client
+        self._always_use_injected_client = always_use_injected_client
+        self._logger = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
+
+    @property
+    def _client(self) -> DatabaseClient:
+        """Resolve the database client this repository's next query should use.
+
+        See ``always_use_injected_client``'s docstring above for the exact
+        rule. Reading this property has no side effect and is safe to call
+        any number of times per request.
+        """
+        if self._always_use_injected_client:
+            return self._default_client
+        return _current_tenant_client.get() or self._default_client
 
     def _query(self) -> Any:
         """Return a fresh PostgREST query builder scoped to this repository's table."""
         return self._client.table(self.table_name)
+
+    def _scoped_query(self, *, company_id: UUID, count: str | None = "exact") -> Any:
+        """Start a SELECT query pre-scoped to one company (tenant).
+
+        Used by repositories whose table stays on the service-role client
+        (``always_use_injected_client=True``) for their company-wide
+        listing/search entry points — the ones most consequential to leave
+        unscoped, since they are designed to span every row a tenant owns.
+        Chaining ``.eq("company_id", ...)`` here, immediately, before any
+        other filter, makes omitting the tenant filter a signature-level
+        impossibility at these call sites rather than a convention a future
+        edit could accidentally drop — the mechanical, CI-enforced half of
+        this package's tenant-isolation architecture (the other half being
+        the per-request RLS client for repositories where that's safe; see
+        ``always_use_injected_client``).
+
+        Args:
+            company_id: The company (tenant) to scope this query to.
+            count: The count method to request (e.g. ``"exact"``), or
+                ``None`` to omit a count — forwarded to ``_select``.
+
+        Returns:
+            A query builder with the tenant filter already applied, ready
+            for further ``.eq()``/``.order()``/etc. calls.
+        """
+        return self._select("*", count=count).eq("company_id", str(company_id))
+
+    def _select(self, *columns: str, count: str | None = None) -> Any:
+        """Start a filtered SELECT query, returning a filter-capable builder.
+
+        The installed postgrest-py (2.x) client's table-level builder
+        (``self._query()``) exposes only ``select``/``insert``/``update``/
+        ``upsert``/``delete`` — filter methods (``.eq``, ``.gte``,
+        ``.order``, ``.range``, etc.) exist only on the builder object one
+        of *those* calls returns. ``.select()`` must therefore be the
+        first call in the chain for any read query; every repository
+        method building a filtered list/count query starts here, never
+        from ``self._query()`` directly, so a caller can never
+        accidentally chain a filter before ``.select()`` has run.
+
+        Args:
+            *columns: The columns to select (``"*"`` for all).
+            count: The count method to request (e.g. ``"exact"``), or
+                ``None`` to omit a count.
+
+        Returns:
+            A query builder ready for ``.eq()``/``.order()``/etc.
+        """
+        return self._query().select(*columns, count=count)
 
     def _execute(self, builder: Any, *, operation: str) -> Any:
         """Execute a query builder, translating any failure into a typed exception.
@@ -244,7 +486,11 @@ class BaseRepository(ABC, Generic[T]):
             RepositoryError: For any other unexpected failure.
         """
         try:
-            return builder.execute()
+            return retry_call(builder.execute, policy=_TRANSIENT_RETRY_POLICY)
+        except RetryExhaustedError as exc:
+            assert isinstance(exc.last_exception, Exception)  # noqa: S101 - all _TRANSIENT_TRANSPORT_EXCEPTIONS are
+            self._translate_and_raise(exc.last_exception, operation=operation)
+            raise  # pragma: no cover - _translate_and_raise always raises
         except Exception as exc:  # noqa: BLE001 - translated below
             self._translate_and_raise(exc, operation=operation)
             raise  # pragma: no cover - _translate_and_raise always raises
@@ -284,9 +530,7 @@ class BaseRepository(ABC, Generic[T]):
                     self.table_name,
                     exc,
                 )
-                raise ConstraintViolationError(
-                    self.table_name, "foreign_key", cause=exc
-                ) from exc
+                raise ConstraintViolationError(self.table_name, "foreign_key", cause=exc) from exc
             if code == _PG_CHECK_VIOLATION:
                 self._logger.warning(
                     "Check constraint violation during %s on '%s': %s",
@@ -394,9 +638,7 @@ class BaseRepository(ABC, Generic[T]):
         row = self._single_row(response, identifier=record_id)
         return mapper(row)
 
-    def find_by_id(
-        self, record_id: UUID, *, mapper: Callable[[dict[str, Any]], T]
-    ) -> T | None:
+    def find_by_id(self, record_id: UUID, *, mapper: Callable[[dict[str, Any]], T]) -> T | None:
         """Fetch exactly one row by primary key, tolerating absence.
 
         Identical to ``get_by_id`` except that a missing row results in
@@ -430,12 +672,13 @@ class BaseRepository(ABC, Generic[T]):
         """Execute a filtered, paginated query and map its results.
 
         Args:
-            builder: A query builder with filters (``.eq``, ``.gte``,
-                etc.) and ordering (``.order``) already applied by the
-                caller, but with ``.select`` and ``.range`` not yet
-                applied — those are applied by this method so that every
-                paginated query in the codebase requests an exact count
-                and an inclusive range consistently.
+            builder: A query builder already started via
+                ``self._select("*", count="exact")``, with filters
+                (``.eq``, ``.gte``, etc.) and ordering (``.order``)
+                already applied by the caller, but with ``.range`` not
+                yet applied — that is applied by this method so that
+                every paginated query in the codebase requests an
+                inclusive range consistently.
             page: The requested page.
             mapper: A callable translating each raw row dict into this
                 repository's record type.
@@ -445,7 +688,7 @@ class BaseRepository(ABC, Generic[T]):
             metadata (API-ADD Section 9).
         """
         response = self._execute(
-            builder.select("*", count="exact").range(page.offset, page.upper_bound),
+            builder.range(page.offset, page.upper_bound),
             operation="paginate",
         )
         rows = self._rows(response)
@@ -466,21 +709,20 @@ class BaseRepository(ABC, Generic[T]):
         and discarding full rows.
 
         Args:
-            builder: A query builder with filters already applied, but
-                with ``.select`` not yet applied.
+            builder: A query builder already started via
+                ``self._select("id", count="exact")``, with filters
+                already applied.
 
         Returns:
             The number of rows matching the filters.
         """
         response = self._execute(
-            builder.select("id", count="exact").limit(1),
+            builder.limit(1),
             operation="count",
         )
         return self._count(response)
 
-    def insert(
-        self, values: dict[str, Any], *, mapper: Callable[[dict[str, Any]], T]
-    ) -> T:
+    def insert(self, values: dict[str, Any], *, mapper: Callable[[dict[str, Any]], T]) -> T:
         """Insert a single row.
 
         Args:

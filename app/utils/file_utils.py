@@ -2,15 +2,16 @@
 
 Per API-ADD Section 23 and the Deployment Guide's file-upload hardening
 section (DG Section 19.6), every uploaded attachment is subject to
-filename sanitization, a content-type allow-list check, a size limit, and
-a checksum computation before its metadata is persisted. This module
-provides each of those checks as an independent, pure, reusable function,
-plus the storage-path construction convention fixed in DSD Section 7.3.
+filename sanitization, a content-type allow-list check, a size limit, a
+declared-vs-actual content-type consistency check, and a checksum
+computation before its metadata is persisted. This module provides each
+of those checks as an independent, pure, reusable function, plus the
+storage-path construction convention fixed in DSD Section 7.3.
 
 This module performs no I/O of its own — it operates entirely on
-in-memory ``bytes``/``str`` values passed in by the caller, which is
-expected to be the component (outside this package's current scope) that
-actually reads an uploaded file and writes it to Supabase Storage.
+in-memory ``bytes``/``str`` values passed in by the caller
+(``app.services.attachment_service.AttachmentService``, which reads an
+uploaded file and writes it to Supabase Storage).
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ __all__ = [
     "compute_sha256_checksum",
     "validate_content_type",
     "validate_file_size",
+    "validate_content_type_consistency",
     "sniff_content_type",
     "get_file_extension",
 ]
@@ -60,6 +62,18 @@ _MAGIC_BYTE_SIGNATURES: tuple[tuple[bytes, str], ...] = (
     # treat a match here as consistent with either, and rely on the
     # content-type allow-list check for the final decision.
     (b"PK\x03\x04", "application/zip"),
+)
+
+#: Declared content types that are themselves ZIP containers, so a
+#: sniffed ``"application/zip"`` signature is consistent with any of
+#: them, not just a literal ``"application/zip"`` upload — used by
+#: ``validate_content_type_consistency``.
+_ZIP_CONTAINER_CONTENT_TYPES: frozenset[str] = frozenset(
+    {
+        "application/zip",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    }
 )
 
 
@@ -151,9 +165,7 @@ def validate_content_type(
     return content_type
 
 
-def validate_file_size(
-    size_bytes: int, *, max_size_bytes: int = MAX_ATTACHMENT_SIZE_BYTES
-) -> int:
+def validate_file_size(size_bytes: int, *, max_size_bytes: int = MAX_ATTACHMENT_SIZE_BYTES) -> int:
     """Validate that a file's size is positive and within the configured limit.
 
     Matches DSD Section 4.1's ``size_bytes > 0`` check constraint and
@@ -204,6 +216,42 @@ def sniff_content_type(content: bytes) -> str | None:
         if content.startswith(signature):
             return mime_type
     return None
+
+
+def validate_content_type_consistency(declared_content_type: str, content: bytes) -> None:
+    """Reject a file whose declared content type contradicts its sniffed one.
+
+    Realizes API-ADD Section 23's mismatch rule: a definite, sniffed
+    signature that disagrees with the declared type is rejected outright.
+    A sniff result of ``None`` (an unrecognized signature — expected for
+    formats such as plain text/CSV, or for legacy OLE2-based
+    ``.doc``/``.xls`` files this function's signature table does not
+    recognize) is not a mismatch: per ``sniff_content_type``'s own
+    documented behavior, the declared type is trusted whenever sniffing
+    cannot independently confirm or contradict it.
+
+    Args:
+        declared_content_type: The content type the uploader's browser
+            declared for this file.
+        content: The file's raw content.
+
+    Raises:
+        FileValidationError: If sniffing produced a signature that
+            contradicts ``declared_content_type`` (and the two are not
+            both members of ``_ZIP_CONTAINER_CONTENT_TYPES``, since the
+            Office Open XML formats this application accepts, ``.docx``/
+            ``.xlsx``, are themselves ZIP containers and therefore always
+            sniff as ``"application/zip"``).
+    """
+    sniffed = sniff_content_type(content)
+    if sniffed is None or sniffed == declared_content_type:
+        return
+    if sniffed == "application/zip" and declared_content_type in _ZIP_CONTAINER_CONTENT_TYPES:
+        return
+    raise FileValidationError(
+        f"File content does not match its declared type (declared "
+        f"'{declared_content_type}', detected '{sniffed}')."
+    )
 
 
 def get_file_extension(filename: str) -> str:

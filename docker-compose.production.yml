@@ -1,0 +1,197 @@
+# Production stack for the Enterprise Automation Hub.
+#
+# Supabase (Postgres/Auth/Storage) remains an external, managed service —
+# this compose file only orchestrates what's actually self-hosted: two
+# backend API replicas (demonstrating Redis-backed Scheduler leader
+# election across instances — docs/scheduler_distributed_coordination.md),
+# two job-system worker roles (default, escalation), frontend, Redis, and
+# the Prometheus/Grafana observability pair.
+#
+# Usage:
+#   cp .env.example .env            # fill in real values
+#   cp frontend/.env.local.example frontend/.env.local
+#   docker compose -f docker-compose.production.yml up -d --build
+#
+# See docs/docker_deployment.md for the full operational guide
+# (migrations, scaling, backups, troubleshooting).
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks: [eah]
+
+  # Two backend replicas, differing only in host port — proof that the
+  # Scheduler's Redis-backed leader election (docs/scheduler_distributed_
+  # coordination.md) actually is safe with more than one instance running.
+  # Both set SCHEDULER_LEADER=true (now meaning "opt into the Scheduler
+  # pool," not "definitely lead" — see SchedulerSettings.is_leader) and
+  # both compete for the same `eah:scheduler:leader` Redis lock: only one
+  # will ever report `scheduler_active: true` via GET /health, and if that
+  # one is stopped the other is elected automatically within one lock TTL
+  # window (SCHEDULER_LEADER_LOCK_TTL_SECONDS, default 30s) — no manual
+  # step, unlike the pre-Redis static designation this replaces. In a real
+  # deployment, put both behind a load balancer/reverse proxy; this file
+  # exposes each directly for that verification and for the simplest
+  # possible single-node reference setup (just run `backend`).
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      SCHEDULER_LEADER: "true"
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [eah]
+
+  backend-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      SCHEDULER_LEADER: "true"
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8001:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [eah]
+
+  # Two containers from the same image, differing only in --role: which
+  # queue_name(s) app.jobs.worker consumes (app.jobs.worker.ROLE_QUEUE_NAMES).
+  # worker-default handles send_email/send_invitation_email; worker-escalation
+  # handles escalate_stage/send_reminder — a dedicated role so a burst of
+  # queued email never delays time-sensitive escalations, and vice versa.
+  worker-default:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "app.jobs.worker", "--role", "default"]
+    # A real liveness probe (app.jobs.healthcheck): checks this worker's
+    # own Redis heartbeat key, refreshed once per loop iteration — unlike
+    # the retired app.queue.worker, this worker never binds an HTTP port
+    # for the inherited backend-image HEALTHCHECK to probe, so a
+    # dedicated CMD is required here instead of the Dockerfile's default.
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.jobs.healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      EMAIL_DISPATCH_MODE: queue
+      WORKER_METRICS_PORT: "9100"
+      # Neither worker joins the Scheduler pool — SCHEDULER_LEADER stays
+      # false here regardless of REDIS_URL being set (unlike backend/
+      # backend-2 above) — only the two backend replicas register jobs
+      # and contend for Scheduler leadership.
+      SCHEDULER_LEADER: "false"
+    expose: ["9100"]
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [eah]
+
+  worker-escalation:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "app.jobs.worker", "--role", "escalation"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.jobs.healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      WORKER_METRICS_PORT: "9100"
+      SCHEDULER_LEADER: "false"
+    expose: ["9100"]
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [eah]
+
+  frontend:
+    # NEXT_PUBLIC_* are baked into the JS bundle at build time (Next.js
+    # convention) — docker compose substitutes ${...} below from *this
+    # file's own directory* .env (not frontend/.env.local, which
+    # env_file below still supplies to the running container), so the
+    # same three values must also be present in the root .env for a
+    # rebuild to pick up a changed Supabase project. See .env.example's
+    # "Frontend Docker build args" section.
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY:-}
+    env_file: frontend/.env.local
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks: [eah]
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks: [eah]
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    environment:
+      # No fallback default: an unset/empty GRAFANA_ADMIN_PASSWORD fails
+      # `docker compose up` outright rather than silently starting this
+      # production stack's Grafana with the well-known `admin` default
+      # password, reachable at :3001 by anyone who can reach the host.
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set in .env — see .env.example. Never left at Grafana's admin default in a reachable environment.}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks: [eah]
+
+networks:
+  eah:
+    driver: bridge
+
+volumes:
+  redis_data:
+  prometheus_data:
+  grafana_data:

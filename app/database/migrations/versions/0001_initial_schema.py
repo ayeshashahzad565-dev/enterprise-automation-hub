@@ -66,8 +66,7 @@ def upgrade() -> None:
         "('pending', 'in_review', 'approved', 'rejected', 'completed');"
     )
     op.execute(
-        "create type public.stage_status as enum "
-        "('pending', 'approved', 'rejected', 'skipped');"
+        "create type public.stage_status as enum " "('pending', 'approved', 'rejected', 'skipped');"
     )
     op.execute(
         "create type public.notification_type as enum "
@@ -77,8 +76,7 @@ def upgrade() -> None:
     # ------------------------------------------------------------------
     # profiles — extends auth.users (user_repository.py:47-86)
     # ------------------------------------------------------------------
-    op.execute(
-        """
+    op.execute("""
         create table public.profiles (
             id          uuid primary key references auth.users(id) on delete cascade,
             full_name   text not null,
@@ -88,21 +86,17 @@ def upgrade() -> None:
             created_at  timestamptz not null default now(),
             updated_at  timestamptz not null default now()
         );
-        """
-    )
+        """)
     # Backs ProfileRepository.list_by_role(role, department=...), used by
     # AssignmentResolver's department_queue strategy. A composite index
     # on (role, department) also serves role-only lookups via its
     # leftmost prefix, so no separate single-column index is needed.
-    op.execute(
-        "create index profiles_role_department_idx on public.profiles (role, department);"
-    )
+    op.execute("create index profiles_role_department_idx on public.profiles (role, department);")
 
     # ------------------------------------------------------------------
     # workflow_definitions (workflow_repository.py:53-96)
     # ------------------------------------------------------------------
-    op.execute(
-        """
+    op.execute("""
         create table public.workflow_definitions (
             id           uuid primary key default gen_random_uuid(),
             request_type text not null,
@@ -114,8 +108,7 @@ def upgrade() -> None:
             created_at   timestamptz not null default now(),
             constraint workflow_definitions_type_version_uq unique (request_type, version)
         );
-        """
-    )
+        """)
     # Enforces "at most one active version per request_type" (relied on
     # by activate_definition's deactivate-then-activate transaction) and
     # backs find_active_for_request_type's lookup, per
@@ -131,8 +124,7 @@ def upgrade() -> None:
     # key to workflow_stages is added further below, once that table
     # exists.
     # ------------------------------------------------------------------
-    op.execute(
-        """
+    op.execute("""
         create table public.requests (
             id                      uuid primary key default gen_random_uuid(),
             requester_id            uuid not null references public.profiles(id),
@@ -150,8 +142,7 @@ def upgrade() -> None:
             updated_at              timestamptz not null default now(),
             completed_at            timestamptz
         );
-        """
-    )
+        """)
     op.execute("create index requests_requester_id_idx on public.requests (requester_id);")
     op.execute(
         "create index requests_workflow_definition_id_idx "
@@ -172,8 +163,7 @@ def upgrade() -> None:
     # ------------------------------------------------------------------
     # workflow_stages (workflow_repository.py:99-150)
     # ------------------------------------------------------------------
-    op.execute(
-        """
+    op.execute("""
         create table public.workflow_stages (
             id             uuid primary key default gen_random_uuid(),
             request_id     uuid not null references public.requests(id) on delete cascade,
@@ -189,8 +179,7 @@ def upgrade() -> None:
             created_at     timestamptz not null default now(),
             constraint workflow_stages_request_order_uq unique (request_id, stage_order)
         );
-        """
-    )
+        """)
     op.execute(
         "create index workflow_stages_request_id_idx on public.workflow_stages (request_id);"
     )
@@ -218,15 +207,12 @@ def upgrade() -> None:
         "add constraint requests_current_stage_id_fkey "
         "foreign key (current_stage_id) references public.workflow_stages(id);"
     )
-    op.execute(
-        "create index requests_current_stage_id_idx on public.requests (current_stage_id);"
-    )
+    op.execute("create index requests_current_stage_id_idx on public.requests (current_stage_id);")
 
     # ------------------------------------------------------------------
     # notifications (notification_repository.py:42-86)
     # ------------------------------------------------------------------
-    op.execute(
-        """
+    op.execute("""
         create table public.notifications (
             id                 uuid primary key default gen_random_uuid(),
             recipient_id       uuid not null references public.profiles(id),
@@ -239,8 +225,7 @@ def upgrade() -> None:
             email_sent_at      timestamptz,
             created_at         timestamptz not null default now()
         );
-        """
-    )
+        """)
     # Backs list_for_recipient / get_unread_count (API-ADD Section
     # 19.8), per notification_repository.py's own docstring referencing
     # this exact composite index.
@@ -248,17 +233,14 @@ def upgrade() -> None:
         "create index notifications_recipient_read_idx "
         "on public.notifications (recipient_id, is_read);"
     )
-    op.execute(
-        "create index notifications_request_id_idx on public.notifications (request_id);"
-    )
+    op.execute("create index notifications_request_id_idx on public.notifications (request_id);")
 
     # ------------------------------------------------------------------
     # audit_logs (audit_repository.py:31-66) — append-only; this
     # repository exposes no update/delete method, matching the
     # database-level grant restriction applied in 0003.
     # ------------------------------------------------------------------
-    op.execute(
-        """
+    op.execute("""
         create table public.audit_logs (
             id          uuid primary key default gen_random_uuid(),
             actor_id    uuid references public.profiles(id),
@@ -267,8 +249,7 @@ def upgrade() -> None:
             metadata    jsonb,
             created_at  timestamptz not null default now()
         );
-        """
-    )
+        """)
     op.execute("create index audit_logs_request_id_idx on public.audit_logs (request_id);")
     op.execute("create index audit_logs_actor_id_idx on public.audit_logs (actor_id);")
     op.execute("create index audit_logs_action_idx on public.audit_logs (action);")
@@ -282,8 +263,7 @@ def upgrade() -> None:
     # base_repository.py's insert/update_with_optimistic_lock), so it is
     # exclusively maintained here.
     # ------------------------------------------------------------------
-    op.execute(
-        """
+    op.execute("""
         create function public.set_updated_at()
         returns trigger
         language plpgsql
@@ -293,8 +273,7 @@ def upgrade() -> None:
             return new;
         end;
         $$;
-        """
-    )
+        """)
     op.execute(
         "create trigger set_profiles_updated_at "
         "before update on public.profiles "

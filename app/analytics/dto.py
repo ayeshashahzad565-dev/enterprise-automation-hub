@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 from uuid import UUID
 
 from app.models import ApprovalThroughput, StatusBreakdown
@@ -39,7 +39,7 @@ __all__ = [
 ]
 
 
-class TimeGranularity(str, Enum):
+class TimeGranularity(StrEnum):
     """The three time-bucket sizes this package's trend aggregations support."""
 
     DAY = "day"

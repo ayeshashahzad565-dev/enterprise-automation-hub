@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Final
 
 from app.config.constants import DEFAULT_LOG_LEVEL, VALID_LOG_LEVELS
@@ -66,7 +66,7 @@ class StructuredFormatter(logging.Formatter):
             fields.
         """
         payload: dict[str, Any] = {
-            "timestamp": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "timestamp": datetime.fromtimestamp(record.created, tz=UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
@@ -107,8 +107,7 @@ def configure_logging(level: str = DEFAULT_LOG_LEVEL) -> None:
     normalized_level = level.strip().upper()
     if normalized_level not in VALID_LOG_LEVELS:
         raise LoggingConfigurationError(
-            f"Invalid log level {level!r}. Expected one of: "
-            f"{sorted(VALID_LOG_LEVELS)}."
+            f"Invalid log level {level!r}. Expected one of: " f"{sorted(VALID_LOG_LEVELS)}."
         )
 
     root_logger = logging.getLogger()

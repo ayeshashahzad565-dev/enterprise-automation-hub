@@ -41,8 +41,7 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    op.execute(
-        """
+    op.execute("""
         create function public.handle_new_user()
         returns trigger
         language plpgsql
@@ -72,8 +71,7 @@ def upgrade() -> None:
             return new;
         end;
         $$;
-        """
-    )
+        """)
     op.execute(
         "create trigger on_auth_user_created "
         "after insert on auth.users "

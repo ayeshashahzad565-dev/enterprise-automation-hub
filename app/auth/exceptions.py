@@ -68,9 +68,7 @@ class MalformedAuthorizationHeaderError(AuthenticationError):
     """
 
     def __init__(self, raw_value: str) -> None:
-        super().__init__(
-            "Authorization header is malformed; expected 'Bearer <token>'."
-        )
+        super().__init__("Authorization header is malformed; expected 'Bearer <token>'.")
         self.raw_value = raw_value
 
 
@@ -91,6 +89,48 @@ class TokenExpiredError(AuthenticationError):
     def __init__(self, expired_at: object) -> None:
         super().__init__(f"Token expired at {expired_at}.")
         self.expired_at = expired_at
+
+
+class CompanyAccessRevokedError(AuthenticationError):
+    """Raised when an otherwise-valid caller's company has been suspended
+    or deleted by a platform admin.
+
+    The caller's own credentials are fine — Supabase Auth and the
+    ``profiles`` lookup both succeeded — but their tenant is no longer
+    usable, which this package treats as an authentication-branch
+    failure (the identity cannot be resolved into a *usable* identity),
+    the same category ``SupabaseTokenVerifier`` already uses for "this
+    account is not fully provisioned."
+
+    Attributes:
+        reason: A short, human-readable reason (``"suspended"`` or
+            ``"deleted"``).
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"This account's company has been {reason}. Contact an administrator.")
+        self.reason = reason
+
+
+class AccountAccessRevokedError(AuthenticationError):
+    """Raised when an otherwise-valid caller's own profile has been
+    deactivated or erased.
+
+    Mirrors ``CompanyAccessRevokedError`` exactly, one level down: the
+    caller's credentials and tenant are both fine, but their own account
+    is not usable, per ``app.services.user_service.UserService.
+    update_profile``/``erase_user``. Checked by
+    ``SupabaseTokenVerifier`` on every request, so deactivation/erasure
+    takes effect immediately rather than at next login.
+
+    Attributes:
+        reason: A short, human-readable reason (``"deactivated"`` or
+            ``"erased"``).
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"This account has been {reason}. Contact an administrator.")
+        self.reason = reason
 
 
 class SessionNotFoundError(AuthenticationError):
@@ -137,8 +177,7 @@ class PermissionDeniedError(AuthorizationError):
 
     def __init__(self, role: str, required_permission: str) -> None:
         super().__init__(
-            f"Role '{role}' does not carry the required permission "
-            f"'{required_permission}'."
+            f"Role '{role}' does not carry the required permission " f"'{required_permission}'."
         )
         self.role = role
         self.required_permission = required_permission
@@ -154,9 +193,7 @@ class RoleNotPermittedError(AuthorizationError):
     """
 
     def __init__(self, role: str, allowed_roles: tuple[str, ...]) -> None:
-        super().__init__(
-            f"Role '{role}' is not permitted; expected one of {allowed_roles}."
-        )
+        super().__init__(f"Role '{role}' is not permitted; expected one of {allowed_roles}.")
         self.role = role
         self.allowed_roles = allowed_roles
 

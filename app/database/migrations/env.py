@@ -26,7 +26,14 @@ from logging.config import fileConfig
 
 from alembic import context
 from dotenv import load_dotenv
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import String, engine_from_config, pool
+
+# Alembic's default `alembic_version.version_num` column is VARCHAR(32).
+# Several revision ids in this project's history (e.g.
+# "0008_user_invitations_status_expires_at_index", 45 chars) exceed that,
+# which breaks `alembic upgrade head` on a fresh database with
+# `StringDataRightTruncation`. Widened well past the longest current id.
+_VERSION_TABLE_COLUMN_TYPE = String(128)
 
 load_dotenv()
 
@@ -75,6 +82,7 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        version_table_column_type=_VERSION_TABLE_COLUMN_TYPE,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -84,11 +92,13 @@ def run_migrations_online() -> None:
     """Apply migrations against a live database connection."""
     configuration = config.get_section(config.config_ini_section, {})
     configuration["sqlalchemy.url"] = _database_url()
-    connectable = engine_from_config(
-        configuration, prefix="sqlalchemy.", poolclass=pool.NullPool
-    )
+    connectable = engine_from_config(configuration, prefix="sqlalchemy.", poolclass=pool.NullPool)
     with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata)
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            version_table_column_type=_VERSION_TABLE_COLUMN_TYPE,
+        )
         with context.begin_transaction():
             context.run_migrations()
 

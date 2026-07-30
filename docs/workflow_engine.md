@@ -6,6 +6,16 @@
 **Author:** Principal Software Architect
 **Component Under Design:** `src/workflows` (the Workflow Engine) and its immediate collaborators (`ApprovalService`, `RequestService`, `AuditService`, `NotificationService`, the APScheduler-based Scheduler)
 
+> **Superseded note:** `src/workflows` and the other `src/`-prefixed paths
+> below refer to EAH's original pre-implementation layout. The Workflow
+> Engine and its collaborators ship today under `app/` (e.g.
+> `app/services/workflow_definition_service.py`,
+> `app/database/repositories/workflow_repository.py`) as part of the
+> FastAPI backend, invoked over HTTP by the Next.js frontend (`frontend/`)
+> rather than in-process by Streamlit. The stage-transition, assignment,
+> and configuration-driven routing design described below is otherwise
+> current.
+
 ---
 
 ## 1. Overview
@@ -926,7 +936,9 @@ The current design invokes `NotificationService` synchronously (if after-commit,
 
 ### 20.6 Distributed Workflow Execution
 
-Should EAH ever need to run workflow evaluation across more than one process (beyond the single-process, in-process Scheduler model this document assumes throughout, per ADD Section 10), the guarantee in Section 9.6 — that all workflow state lives in PostgreSQL, never in engine-internal memory — is precisely what would make that transition tractable: any process holding a valid Supabase connection can resolve a definition, generate a stage, or decide an approval identically, because no part of this design depends on affinity to a specific process instance. This document does not propose implementing distributed execution; it notes that today's design does not foreclose it.
+**Since implemented** (not hypothetical): the Scheduler now runs across multiple instances safely, via Redis-backed leader election (`app.scheduler.leader_election.LeaderElection`) — see `docs/scheduler_distributed_coordination.md` for the full mechanism, including the per-job lock that guards against duplicate execution in a split-brain window, and `docker-compose.production.yml`'s `backend`/`backend-2` reference topology. The rationale below, describing *why* this document's design permitted that transition without a rewrite, remains accurate and is kept for that reason.
+
+Should EAH ever need to run workflow evaluation across more than one process (beyond the single-process, in-process Scheduler model this document assumes throughout, per ADD Section 10), the guarantee in Section 9.6 — that all workflow state lives in PostgreSQL, never in engine-internal memory — is precisely what would make that transition tractable: any process holding a valid Supabase connection can resolve a definition, generate a stage, or decide an approval identically, because no part of this design depends on affinity to a specific process instance.
 
 ---
 

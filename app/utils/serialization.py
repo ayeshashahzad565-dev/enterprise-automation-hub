@@ -17,9 +17,11 @@ package (or any future one).
 
 from __future__ import annotations
 
-from typing import Any, Iterable, TypeVar
+from collections.abc import Iterable
+from typing import Any, TypeVar
 
-from pydantic import BaseModel, ValidationError as PydanticValidationError
+from pydantic import BaseModel
+from pydantic import ValidationError as PydanticValidationError
 
 from app.utils.exceptions import DeserializationError, SerializationError
 

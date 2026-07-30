@@ -2,9 +2,11 @@
 
 Per DSD Section 3.7 and WEDD Section 15, this table stores every
 notification generated for a user, whether triggered synchronously by a
-request-lifecycle event or asynchronously by the Scheduler. This module
-defines the ``NotificationType`` enum and the ``NotificationRepository``
-class.
+request-lifecycle event or asynchronously by the Scheduler.
+``NotificationType`` is re-exported here from ``app.models.enums`` (the
+single canonical definition, per DSD Section 1.5) purely for backward
+compatibility with existing call sites that import it from this module,
+alongside the ``NotificationRepository`` class.
 """
 
 from __future__ import annotations
@@ -12,7 +14,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum
 from typing import Any
 from uuid import UUID
 
@@ -21,22 +22,15 @@ from app.database.repositories.base_repository import (
     BaseRepository,
     Page,
     PagedResult,
+    escape_ilike_special_characters,
     parse_datetime,
     parse_uuid,
 )
+from app.models.enums import NotificationType
 
 logger = logging.getLogger(__name__)
 
-
-class NotificationType(str, Enum):
-    """The six values fixed by DSD Section 1.5's ``notification_type`` enum."""
-
-    ASSIGNMENT = "assignment"
-    REMINDER = "reminder"
-    ESCALATION = "escalation"
-    DECISION = "decision"
-    COMPLETION = "completion"
-    SYSTEM = "system"
+__all__ = ["NotificationType", "NotificationRecord", "NotificationRepository"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +49,8 @@ class NotificationRecord:
         email_sent: Whether the corresponding email was dispatched
             successfully.
         email_sent_at: The timestamp of successful email dispatch, if any.
+        archived_at: The timestamp the recipient archived this
+            notification, if any.
         created_at: Notification creation timestamp.
     """
 
@@ -67,6 +63,7 @@ class NotificationRecord:
     read_at: datetime | None
     email_sent: bool
     email_sent_at: datetime | None
+    archived_at: datetime | None
     created_at: datetime
 
 
@@ -82,6 +79,7 @@ def _map_notification_row(row: dict[str, Any]) -> NotificationRecord:
         read_at=parse_datetime(row.get("read_at")),
         email_sent=row["email_sent"],
         email_sent_at=parse_datetime(row.get("email_sent_at")),
+        archived_at=parse_datetime(row.get("archived_at")),
         created_at=parse_datetime(row["created_at"]),  # type: ignore[arg-type]
     )
 
@@ -95,8 +93,8 @@ class NotificationRepository(BaseRepository[NotificationRecord]):
 
     table_name = "notifications"
 
-    def __init__(self, client: DatabaseClient) -> None:
-        super().__init__(client)
+    def __init__(self, client: DatabaseClient, *, always_use_injected_client: bool) -> None:
+        super().__init__(client, always_use_injected_client=always_use_injected_client)
 
     def get_by_id(self, notification_id: UUID) -> NotificationRecord:  # type: ignore[override]
         """Fetch a notification by its id.
@@ -190,6 +188,81 @@ class NotificationRepository(BaseRepository[NotificationRecord]):
         row = self._single_row(response, identifier=notification_id)
         return _map_notification_row(row)
 
+    def mark_all_read(self, recipient_id: UUID) -> int:
+        """Mark every currently unread notification for a recipient as read.
+
+        A single bulk update rather than one call per row, so "mark all
+        read" is one round trip regardless of how many notifications are
+        unread.
+
+        Args:
+            recipient_id: The recipient's user id.
+
+        Returns:
+            The number of notifications that were updated (``0`` if none
+            were unread).
+        """
+        response = self._execute(
+            self._query()
+            .update(
+                {
+                    "is_read": True,
+                    "read_at": datetime.now().astimezone().isoformat(),
+                }
+            )
+            .eq("recipient_id", str(recipient_id))
+            .eq("is_read", False),
+            operation="mark_all_read",
+        )
+        return len(self._rows(response))
+
+    def archive(self, notification_id: UUID) -> NotificationRecord:
+        """Archive a notification, removing it from the recipient's default view.
+
+        A plain, unconditional update, mirroring ``mark_read``'s own
+        rationale: only the recipient themselves ever archives their own
+        notification, so there is no concurrent-writer conflict to guard
+        against with optimistic locking.
+
+        Args:
+            notification_id: The notification's ``id``.
+
+        Returns:
+            The updated ``NotificationRecord``, with ``archived_at`` set.
+
+        Raises:
+            RecordNotFoundError: If no notification with this id exists or
+                is visible under the current client's RLS context.
+        """
+        response = self._execute(
+            self._query()
+            .update({"archived_at": datetime.now().astimezone().isoformat()})
+            .eq("id", str(notification_id)),
+            operation="archive",
+        )
+        row = self._single_row(response, identifier=notification_id)
+        return _map_notification_row(row)
+
+    def unarchive(self, notification_id: UUID) -> NotificationRecord:
+        """Restore an archived notification to the recipient's default view.
+
+        Args:
+            notification_id: The notification's ``id``.
+
+        Returns:
+            The updated ``NotificationRecord``, with ``archived_at`` cleared.
+
+        Raises:
+            RecordNotFoundError: If no notification with this id exists or
+                is visible under the current client's RLS context.
+        """
+        response = self._execute(
+            self._query().update({"archived_at": None}).eq("id", str(notification_id)),
+            operation="unarchive",
+        )
+        row = self._single_row(response, identifier=notification_id)
+        return _map_notification_row(row)
+
     def mark_email_sent(self, notification_id: UUID) -> NotificationRecord:
         """Record that a notification's corresponding email was dispatched.
 
@@ -222,6 +295,9 @@ class NotificationRepository(BaseRepository[NotificationRecord]):
         recipient_id: UUID,
         *,
         is_read: bool | None = None,
+        notification_type: NotificationType | None = None,
+        is_archived: bool | None = False,
+        search: str | None = None,
         page: Page = Page(),
     ) -> PagedResult[NotificationRecord]:
         """List notifications for a specific recipient.
@@ -234,33 +310,89 @@ class NotificationRepository(BaseRepository[NotificationRecord]):
             recipient_id: The recipient's user id.
             is_read: Restrict to read or unread notifications, if
                 provided.
+            notification_type: Restrict to a single notification category,
+                if provided.
+            is_archived: Restrict to archived (``True``) or active
+                (``False``) notifications. Defaults to ``False`` (the
+                recipient's ordinary, active view); pass ``None`` to
+                include both.
+            search: Free-text search matched case-insensitively against
+                ``message``, if provided. Escaped via
+                ``escape_ilike_special_characters`` before being handed
+                to ``.ilike()``, matching ``CommentRepository.search``'s
+                own free-text-search shape.
             page: The page to retrieve, newest first.
 
         Returns:
             A ``PagedResult`` of matching notifications.
         """
-        builder = self._query().eq("recipient_id", str(recipient_id))
+        builder = self._select("*", count="exact").eq("recipient_id", str(recipient_id))
         if is_read is not None:
             builder = builder.eq("is_read", is_read)
+        if notification_type is not None:
+            builder = builder.eq("notification_type", notification_type.value)
+        if is_archived is not None:
+            builder = (
+                builder.not_.is_("archived_at", "null")
+                if is_archived
+                else builder.is_("archived_at", "null")
+            )
+        if search:
+            pattern = f"%{escape_ilike_special_characters(search.strip())}%"
+            builder = builder.ilike("message", pattern)
         builder = builder.order("created_at", desc=True)
         return self.paginate(builder, page, mapper=_map_notification_row)
 
+    def search_for_recipient(
+        self, query_text: str, recipient_id: UUID, *, page: Page = Page()
+    ) -> PagedResult[NotificationRecord]:
+        """Free-text search across one recipient's own notification messages.
+
+        A dedicated entry point for ``GlobalSearchService`` over
+        ``list_for_recipient``'s existing ``search`` parameter — every
+        other cross-entity search method in this codebase (``search_requests``,
+        ``CommentRepository.search``, ``AuditRepository.search``) has its
+        own top-level method rather than being reached only through a
+        broader listing method's optional filter, so this gives
+        notifications the same shape. Includes both read and archived
+        notifications (``is_archived=None``), unlike a recipient's
+        ordinary notification list, since a global search should not
+        silently hide an archived match.
+
+        Args:
+            query_text: The search term, matched against ``message`` via
+                the ``notifications_message_trgm_idx`` trigram index
+                (``0018_search_indexes``).
+            recipient_id: Restricts results to this recipient only.
+            page: The page to retrieve.
+
+        Returns:
+            A ``PagedResult`` of matching notifications, newest first.
+        """
+        return self.list_for_recipient(
+            recipient_id, is_archived=None, search=query_text, page=page
+        )
+
     def get_unread_count(self, recipient_id: UUID) -> int:
-        """Return the number of unread notifications for a recipient.
+        """Return the number of unread, active (non-archived) notifications
+        for a recipient.
 
         Corresponds to ``GET /api/v1/notifications/unread-count`` (API-ADD
         Section 19.8.3), issuing a count-only query rather than fetching
-        full notification rows.
+        full notification rows. An archived notification never contributes
+        to this count, since archiving is how a recipient signals a
+        notification no longer needs their attention.
 
         Args:
             recipient_id: The recipient's user id.
 
         Returns:
-            The number of unread notifications.
+            The number of unread, active notifications.
         """
         builder = (
-            self._query()
+            self._select("id", count="exact")
             .eq("recipient_id", str(recipient_id))
             .eq("is_read", False)
+            .is_("archived_at", "null")
         )
         return self.count(builder)

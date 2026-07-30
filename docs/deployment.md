@@ -1,10 +1,12 @@
 # Enterprise Automation Hub (EAH)
 ## Deployment Guide (DG)
 
-**Version:** 1.0
+**Version:** 2.0
 **Status:** Finalized — consistent with the SRS, Architecture Design Document (ADD), Database Schema Design Document (DSD), API Design Document (API-ADD), Workflow Engine Design Document (WEDD), and Testing Strategy Document (TSD)
 **Author:** Principal DevOps Architect
-**Deployment Model:** Single Python process (Streamlit UI + Application Services + in-process APScheduler), horizontally replicated behind a standard load balancer, backed by Supabase
+**Deployment Model:** Containerized FastAPI backend + Next.js frontend + background worker, horizontally replicated behind a standard load balancer, backed by Supabase (Postgres/Auth/Storage) and an optional shared Redis (rate limiting, analytics caching, background email queue)
+
+> **Version 2.0 note:** This revision replaces every reference to the original Streamlit Presentation Layer, fully removed in favor of the FastAPI + Next.js split described throughout `PROJECT_SUMMARY.md`, and adds the production infrastructure layer introduced alongside it: Docker/Docker Compose, Redis, Prometheus/Grafana, and a GitHub Actions CD pipeline. See `docs/docker_deployment.md` for the concrete, command-level operational guide this document's Section 6 now points to; the sections below remain the architectural/policy-level deployment reference.
 
 ---
 
@@ -15,7 +17,7 @@
 3. Environment Strategy
 4. Infrastructure Overview
 5. Application Deployment
-6. Streamlit Deployment
+6. Application Deployment: FastAPI + Next.js + Docker
 7. Supabase Configuration
 8. Environment Variables
 9. Secret Management
@@ -63,24 +65,32 @@ Principal and senior engineers responsible for deploying, operating, and maintai
 | WEDD | Workflow Engine internals, running-workflow isolation, Scheduler job design | Deployment-time guidance for safe workflow-definition activation and safe multi-instance Scheduler operation (Sections 12–13) |
 | TSD | Test categories and the CI pipeline's migration verification step | The production verification checklist (Section 20) that extends TSD Section 18 into a deployment-specific procedure |
 
-This document introduces no infrastructure, service, or technology beyond Python 3.11, Streamlit, Supabase (PostgreSQL, Auth, Storage), Pydantic v2, APScheduler, Plotly, and pytest — the fixed stack established in the ADD. No container orchestration platform, message broker, distributed cache, or infrastructure-as-code tool is introduced anywhere in this document.
+As of Version 2.0, this document's fixed stack is: Python 3.11 (FastAPI backend), Node 20 (Next.js frontend), Supabase (PostgreSQL, Auth, Storage), Pydantic v2, APScheduler, pytest, Docker/Docker Compose as the containerization and local-orchestration mechanism, and an optional shared Redis instance (rate limiting, analytics response caching, and the job system's live dispatch layer — retry/backoff, dead-letter, priority, for email/invitation delivery and escalation/reminder execution — see Section 4). No message broker beyond that single Redis instance, no full container-orchestration platform (Kubernetes or equivalent), and no dedicated infrastructure-as-code tool is introduced — Docker Compose is deliberately the ceiling of this document's orchestration scope, not a stepping stone assumed to lead there.
 
 ---
 
 ## 2. Deployment Architecture
 
-EAH is deployed as one or more identical instances of a single Python process, each instance running the full modular monolith described in the ADD — Presentation Layer, Application Services, Domain Layer, Repository Layer, and an in-process APScheduler — with all instances connecting to the same Supabase project. This is the direct, and only, realization of the ADD's Scalability Considerations (ADD Section 10): stateless horizontal scaling of the application process behind a standard load balancer, with durable state held exclusively in Supabase.
+EAH is deployed as containerized services: one or more identical `backend` containers (FastAPI + Application Services + Domain Layer + Repository Layer + an in-process APScheduler), one or more identical `frontend` containers (Next.js), the job system's two worker roles (`worker-default`, `worker-escalation` — Section 13.7), and the shared infrastructure they depend on (Supabase, and an optional Redis). This is the direct realization of the ADD's Scalability Considerations (ADD Section 10): stateless horizontal scaling of the application containers behind a standard load balancer, with durable business state held exclusively in Supabase (including every job's own status/history, in the `jobs` table) — Redis, where configured, holds only rate-limit counters, a short-TTL analytics cache, and each job's ephemeral live-dispatch pointer, none of which is a system of record.
 
 ```mermaid
 flowchart TB
     Users([Users]) --> LB[Standard Load Balancer]
-    LB --> I1["Application Instance 1<br/>(Streamlit + Services + APScheduler)"]
-    LB --> I2["Application Instance 2<br/>(Streamlit + Services + APScheduler, jobs disabled)"]
-    LB --> I3["Application Instance N<br/>(Streamlit + Services + APScheduler, jobs disabled)"]
+    LB --> F1["Frontend Container(s)<br/>(Next.js)"]
+    LB --> B1["Backend Container 1<br/>(FastAPI + Services + APScheduler)"]
+    LB --> B2["Backend Container N<br/>(FastAPI + Services + APScheduler, jobs disabled)"]
+    B1 --> W1["worker-default<br/>(app.jobs.worker --role default)"]
+    B1 --> W2["worker-escalation<br/>(app.jobs.worker --role escalation)"]
 
-    I1 --> SB[(Supabase Project)]
-    I2 --> SB
-    I3 --> SB
+    B1 --> SB[(Supabase Project)]
+    B2 --> SB
+    F1 --> SB
+    W1 --> SB
+    W2 --> SB
+    B1 --> RD[(Redis — optional)]
+    B2 --> RD
+    W1 --> RD
+    W2 --> RD
 
     subgraph SB_Detail["Supabase"]
         PG[(PostgreSQL + RLS)]
@@ -91,9 +101,9 @@ flowchart TB
     SB --- SB_Detail
 ```
 
-Each instance is identical in code and configuration except for one deliberate difference — whether its in-process Scheduler is the active leader (Section 13) — which is itself an environment-variable-driven configuration difference, not a code difference, consistent with the ADD's statement that Scheduler jobs "can be tuned or disabled per deployment... using a simple leader flag in configuration."
+Each backend container is identical in code and configuration except for one deliberate difference — whether its in-process Scheduler is the active leader (Section 13) — which is itself an environment-variable-driven configuration difference, not a code difference, consistent with the ADD's statement that Scheduler jobs "can be tuned or disabled per deployment... using a simple leader flag in configuration." Neither worker role has a leader concept of its own (Section 13.7) since Redis's per-priority-list semantics already guarantee each job is delivered to exactly one consumer — running more than one replica of either role is safe.
 
-No instance holds business state locally: every request, workflow stage, comment, attachment reference, notification, and audit entry lives in Supabase, per the DSD. This is what makes the topology above safe to scale horizontally without session affinity beyond the user's own authenticated session token (managed by Supabase Auth, not by any individual instance).
+No backend or frontend container holds business state locally: every request, workflow stage, comment, attachment reference, notification, job, and audit entry lives in Supabase, per the DSD. This is what makes the topology above safe to scale horizontally without session affinity beyond the user's own authenticated session token (managed by Supabase Auth, not by any individual instance). Redis, when configured, is itself a single shared instance every backend/worker container connects to — not sharded or replicated per container — consistent with Section 4's "one small, optional, shared cache/queue" scope.
 
 ---
 
@@ -114,16 +124,20 @@ Configuration differences between environments are expressed entirely through en
 
 | Component | Technology | Notes |
 |---|---|---|
-| Application runtime | Python 3.11 | The fixed language/runtime version; no alternate runtime is supported |
-| UI/Presentation | Streamlit | Runs as the application process's own server (Section 6); no separate web server or reverse-proxy technology is introduced beyond the load balancer already established in ADD Section 10 |
+| Application runtime | Python 3.11 (FastAPI + Uvicorn) | The fixed backend language/runtime version; no alternate runtime is supported |
+| Frontend runtime | Node 20 (Next.js, standalone output) | Runs as its own containerized server (`next start` via the standalone build); no separate web server or reverse-proxy technology is introduced beyond the load balancer already established in ADD Section 10 |
 | Database | Supabase-managed PostgreSQL | Per the DSD; schema, RLS, and constraints as specified there |
 | Authentication | Supabase Auth (GoTrue) | Per the ADD and DSD; no separate identity provider is introduced |
 | File Storage | Supabase Storage | Per the DSD and API-ADD Section 23 |
-| Background Jobs | APScheduler, in-process | Per the ADD and WEDD; no external job queue or broker is introduced |
-| Load Distribution | A standard load balancer (ADD Section 10) | Vendor-agnostic by design; any load balancer capable of routing HTTP traffic to multiple stateless backend instances satisfies this requirement, and none is prescribed beyond that capability |
-| Process Hosting | One or more long-lived Python processes, each running the full application | No container orchestration platform is introduced; each instance is a standard OS-level Python process, optionally supervised by the hosting platform's own process-management facility |
+| Cache / Rate Limiting / Job System | Redis 7 — **optional** | Absent `REDIS_URL`, every rate limiter and the analytics response cache fall back to their original single-process, in-memory implementations, and every job type dispatches synchronously (see `app.bootstrap`). Configured, Redis backs a shared, multi-instance-safe rate limiter and analytics cache, plus the job system's live dispatch layer (`app.jobs`) — retry/backoff, dead-letter, priority, consumed by the `worker-default`/`worker-escalation` containers (Section 13.7). One instance only — not sharded/replicated — and holds no business data; the `jobs` table (Postgres) is the durable record (Section 16.5) |
+| Background Jobs (scheduled + queued) | APScheduler, in-process (backend container), plus `app.jobs` (Redis+Postgres) | Per the ADD and WEDD; a leader-elected job *scheduler* discovers eligible work (escalations, reminders, stuck-job recovery) and enqueues it; the job system's workers (or, with no Redis configured, the Scheduler leader's own thread) execute it |
+| Metrics | Prometheus (`GET /metrics`, plus each worker's own `:9100/metrics`) + Grafana | Enabled by default (`METRICS_ENABLED=true`); see Section 15.6 |
+| Containerization | Docker (multi-stage `Dockerfile`/`frontend/Dockerfile`), Docker Compose | `docker-compose.production.yml` and `docker-compose.development.yml` — see `docs/docker_deployment.md`. No full container-orchestration platform (Kubernetes or equivalent) is introduced; Compose is this document's orchestration ceiling |
+| CD (image publishing) | GitHub Actions (`.github/workflows/cd.yml`) | Builds and pushes backend/frontend images to GHCR on every push to `main`; deploying a published image to a specific host remains a manual/pluggable operator step (no target host is assumed) |
+| Load Distribution | A standard load balancer (ADD Section 10) | Vendor-agnostic by design; any load balancer capable of routing HTTP traffic to multiple stateless backend/frontend containers satisfies this requirement, and none is prescribed beyond that capability |
+| Process Hosting | One or more container instances (backend, frontend, worker-default, worker-escalation), each running one of the images `cd.yml` publishes | Docker Compose is the reference orchestration mechanism (Section 6); any host capable of running Docker containers and reaching Supabase (and, if configured, Redis) over the network satisfies this architecture |
 
-This table is deliberately free of a named cloud vendor or hosting product, because the ADD and DSD establish only the *logical* infrastructure (Supabase, a load balancer, a Python process) and not a specific commercial hosting choice — any hosting environment capable of running a long-lived Python 3.11 process and reaching the Supabase project over HTTPS satisfies this architecture.
+This table is deliberately free of a named cloud vendor or hosting product, because the ADD and DSD establish only the *logical* infrastructure (Supabase, a load balancer, containerized processes) and not a specific commercial hosting choice — any hosting environment capable of running Docker containers and reaching the Supabase project over HTTPS satisfies this architecture.
 
 ---
 
@@ -131,7 +145,7 @@ This table is deliberately free of a named cloud vendor or hosting product, beca
 
 ### 5.1 Deployment Artifact
 
-The deployment artifact is the application's Python source tree (`src/`) together with its declared dependency set (matching the fixed stack exactly: Streamlit, the Supabase client library, Pydantic v2, APScheduler, Plotly, and their transitive dependencies), installed into a Python 3.11 environment. No build step compiles this into a different runtime artifact — deployment is source-plus-dependencies, run directly by the Python interpreter, consistent with the ADD's description of EAH as "a single deployable Python package."
+The deployment artifact is a pair of Docker images — `Dockerfile` (backend: FastAPI, Uvicorn, the Supabase client library, Pydantic v2, APScheduler, Redis client, and their transitive dependencies) and `frontend/Dockerfile` (Next.js standalone build) — each built via a multi-stage build (Section 6) so the final image contains only the runtime dependency set, never the build toolchain. `.github/workflows/cd.yml` builds and publishes both to GHCR on every push to `main`; deployment is "pull an image tag and run it," not "install source and dependencies onto a host directly."
 
 ### 5.2 Deployment Steps
 
@@ -140,9 +154,9 @@ The deployment artifact is the application's Python source tree (`src/`) togethe
 | 1 | Provision or confirm the target Supabase project (Section 7) | DSD |
 | 2 | Set environment variables for the target environment (Section 8) | ADD (Configuration Loader) |
 | 3 | Apply pending Alembic migrations against the target database (Section 11) | DSD Section 15 |
-| 4 | Install the application's Python dependencies into the target runtime | This document |
-| 5 | Start the application process(es), with exactly one instance's Scheduler flag enabled as leader (Section 13) | ADD Section 10 |
-| 6 | Register all instances behind the load balancer (Section 2) | This document |
+| 4 | Pull (or build) the backend/frontend images for the commit/tag being deployed (Section 6) | This document / `docs/docker_deployment.md` |
+| 5 | Start the containers — with `REDIS_URL` configured, every `backend` replica may run with `SCHEDULER_LEADER=true` (Redis-backed election picks the live leader automatically, Section 13.2); without it, exactly one replica must — and, if `REDIS_URL` is configured, at least one `worker-default` and one `worker-escalation` container (Section 13.7) | ADD Section 10 |
+| 6 | Register all backend/frontend containers behind the load balancer (Section 2) | This document |
 | 7 | Execute the Production Verification Checklist (Section 20) | TSD Section 18 (extended) |
 
 ### 5.3 Deployment Workflow Diagram
@@ -153,10 +167,11 @@ flowchart TD
     B --> C[Apply Alembic migrations<br/>Section 11]
     C --> D{Migration successful?}
     D -->|No| D1[Abort deployment<br/>Section 18 rollback]
-    D -->|Yes| E[Install application dependencies]
-    E --> F[Start application instance 1<br/>SCHEDULER_LEADER=true]
-    F --> G[Start application instances 2..N<br/>SCHEDULER_LEADER=false]
-    G --> H[Register instances behind load balancer]
+    D -->|Yes| E[Pull/build backend + frontend images<br/>Section 6]
+    E --> F[Start backend container 1<br/>SCHEDULER_LEADER=true]
+    F --> G[Start backend containers 2..N<br/>SCHEDULER_LEADER=false]
+    G --> G2[Start frontend + worker-default + worker-escalation containers]
+    G2 --> H[Register instances behind load balancer]
     H --> I[Run Production Verification Checklist<br/>Section 20]
     I --> J{All checks pass?}
     J -->|No| D1
@@ -165,49 +180,55 @@ flowchart TD
 
 ### 5.4 Startup Sequence
 
-On process start, each instance performs the same, deterministic sequence, regardless of environment:
+On container start, each backend container performs the same, deterministic sequence, regardless of environment:
 
 ```mermaid
 sequenceDiagram
-    participant OS as Process Supervisor / OS
-    participant App as Application Process
+    participant OS as Container Runtime
+    participant App as Backend Container
     participant CL as Configuration Loader
     participant Supa as Supabase
+    participant Rds as Redis (optional)
     participant Sched as APScheduler (in-process)
-    participant UI as Streamlit Server
+    participant API as Uvicorn/FastAPI
 
-    OS->>App: start process
-    App->>CL: load environment variables + static JSON config (DSD Section 5)
-    CL-->>App: typed Pydantic settings object
+    OS->>App: start container
+    App->>CL: load environment variables (DSD Section 5)
+    CL-->>App: typed AppSettings object
     App->>Supa: establish client connection (anon-key and, where applicable, service-role)
     Supa-->>App: connection confirmed
+    App->>Rds: connect, if REDIS_URL is configured
+    Rds-->>App: connection confirmed (or skipped entirely if unconfigured)
     App->>App: initialize logging (Section 14)
     alt SCHEDULER_LEADER = true
-        App->>Sched: register Escalation Check, Reminder Dispatch, Nightly Analytics jobs
+        App->>Sched: register Escalation Check, Reminder Dispatch jobs
         Sched-->>App: jobs scheduled
     else SCHEDULER_LEADER = false
         App->>App: skip Scheduler job registration
     end
-    App->>UI: start Streamlit server, bind to configured port
-    UI-->>OS: ready to accept connections
-    App->>App: expose GET /api/v1/health per API-ADD Section 27
+    App->>API: start Uvicorn, bind 0.0.0.0:8000
+    API-->>OS: ready to accept connections
+    App->>App: expose GET /api/v1/health, /health/live, /health/ready, /metrics
 ```
 
 A failure at any step above (configuration validation failure, inability to reach Supabase) prevents the instance from reporting healthy on `GET /api/v1/health` (Section 15.5), which keeps the load balancer from routing traffic to a not-yet-ready or misconfigured instance.
 
 ---
 
-## 6. Streamlit Deployment
+## 6. Application Deployment: FastAPI + Next.js + Docker
 
-Streamlit is run using its own built-in server — the same mechanism used in local development — bound to a configured host and port, per the ADD's characterization of Streamlit as the Presentation Layer's runtime, not a separate deployment concern requiring its own infrastructure. Each application instance (Section 2) runs exactly one Streamlit server process, serving both the UI and, per the API-ADD's Section 1.2 clarification, the same in-process Application Service calls that this document's REST specification describes as a contract layer over.
+The backend (FastAPI/Uvicorn) and frontend (Next.js) are each built as a multi-stage Docker image (`Dockerfile`, `frontend/Dockerfile`) and run as non-root containers, orchestrated locally/on a single host via Docker Compose (`docker-compose.production.yml`, `docker-compose.development.yml`). This section covers the architectural guidance; **`docs/docker_deployment.md` is the concrete, command-level operational guide** (build/run commands, environment variable reference, migration execution, troubleshooting) and should be treated as this section's companion, not a duplicate.
 
 | Configuration Aspect | Guidance |
 |---|---|
-| Bind address/port | Configured via environment variable (Section 8), read through the Configuration Loader; never hard-coded |
-| Session state | Held entirely in Streamlit's own in-memory session state per user browser session, per the ADD — no server-side session store is introduced, and no instance persists session data to disk or to Supabase |
-| Multiple instances | Each instance runs its own independent Streamlit server; the load balancer (Section 2), not Streamlit itself, is responsible for distributing users across instances |
-| Static assets | Served by Streamlit's own built-in mechanism; no separate CDN or static-file service is introduced |
-| TLS termination | Performed at the load balancer (Section 19.2), not within the Streamlit process itself, keeping the application's own configuration surface minimal |
+| Bind address/port | Backend binds `0.0.0.0:8000`, frontend `0.0.0.0:3000`, both fixed in their respective Dockerfiles and `docker-compose.production.yml`; the load balancer routes to whichever host ports those containers are published on |
+| Session state | Held entirely client-side (the Supabase browser client's own session, per the ADD/API-ADD) — no server-side session store is introduced, and no container persists session data to disk or to Supabase |
+| Multiple instances | `docker compose up --scale backend=N` (or an equivalent instance count on whatever host runs the published images) runs N identical, stateless backend containers; the load balancer, not Docker Compose itself, is responsible for distributing users across them. `worker-default`/`worker-escalation` may each be scaled independently of `backend` replica count and of each other (Section 13.7) |
+| Static assets | Served by Next.js's own standalone server (`.next/static`, copied into the frontend image per `frontend/Dockerfile`); no separate CDN or static-file service is introduced |
+| TLS termination | Performed at the load balancer (Section 19.2), not within either container, keeping each image's own configuration surface minimal |
+| Non-root execution | Both images run as a fixed non-root user (`appuser` in the backend image, Node's built-in `node` user in the frontend image) — neither container ever runs as root |
+| Health checks | Each image declares a `HEALTHCHECK` (backend: `GET /api/v1/health/live`; frontend: `GET /api/health`) so `docker ps`/Compose/an orchestrator can observe container health directly, independent of the load balancer's own probe (Section 15.2) |
+| Image publishing | `.github/workflows/cd.yml` builds and pushes both images to GHCR on every push to `main`; see `docs/docker_deployment.md` for pulling a specific tag on a target host |
 
 ---
 
@@ -240,6 +261,7 @@ All configuration is supplied via environment variables, read exclusively throug
 
 | Variable | Purpose | Present In |
 |---|---|---|
+| `APP_ENVIRONMENT` | The master switch every other hardening check in this table is keyed off (`Environment.requires_production_grade_hardening`, `app/config/environment.py`): `staging`/`production` require `CORS_ALLOWED_ORIGINS`/`APP_BASE_URL`/every `SMTP_*` variable and disable interactive API docs; `development`/`testing` do not. **Defaults to `development` if unset — there is no runtime cross-check that this was set intentionally in a real deployment.** Setting this correctly is the first, load-bearing step of any Staging/Production deployment; see the Deployment Checklist's first item | All environments; one of `development`/`testing`/`staging`/`production` |
 | `SUPABASE_URL` | The target Supabase project's API URL | All environments |
 | `SUPABASE_ANON_KEY` | Client-facing key, subject to RLS (DSD Section 9.3) | All environments |
 | `SUPABASE_SERVICE_ROLE_KEY` | Elevated, server-side-only key for legitimately cross-cutting operations (DSD Section 9.3) | All environments; never exposed to the browser |
@@ -249,7 +271,12 @@ All configuration is supplied via environment variables, read exclusively throug
 | `WORKFLOW_CONFIG_PATH` (or equivalent database-backed resolution, per DSD Section 5) | Resolution source for workflow definitions | All environments |
 | `LOG_LEVEL` | Logging verbosity (Section 14) | All environments |
 | `RATE_LIMIT_*` | Per-endpoint-category rate limits (API-ADD Section 15) | Staging, Production (Development and CI may relax or disable these) |
-| `STREAMLIT_SERVER_ADDRESS`, `STREAMLIT_SERVER_PORT` | Streamlit bind configuration (Section 6) | All environments |
+| `REDIS_URL` | Enables Redis-backed rate limiting, analytics caching, and the job system's live dispatch layer (Section 4) | Optional in every environment; absent means every fallback described in Section 4's Redis row applies |
+| `EMAIL_DISPATCH_MODE` | `direct` (default) or `queue` — selects synchronous vs. job-system-queued email/invitation dispatch (Section 13.7) | Optional; `queue` requires `REDIS_URL` |
+| `WORKER_ROLE` | Which `queue_name`(s) `python -m app.jobs.worker` consumes when run with no `--role` flag: `default`, `escalation`, or `all` | Only meaningful for a worker container; `docker-compose.production.yml` sets it via `--role` instead |
+| `JOB_DEFAULT_MAX_ATTEMPTS`, `WORKER_METRICS_PORT`, `STUCK_JOB_THRESHOLD_MINUTES`, `STUCK_JOB_REAPER_INTERVAL_MINUTES` | Job system retry-budget default, each worker's own Prometheus port, and `StuckJobReaperJob`'s orphan-detection threshold/interval (Section 13.7) | Optional everywhere; all have sensible defaults — see `.env.example` |
+| `METRICS_ENABLED` | Whether `GET /metrics` is mounted (Section 15.6) | Optional, defaults to `true` in every environment |
+| `GRAFANA_ADMIN_PASSWORD` | Grafana's initial admin password (`docker-compose.production.yml` only). Required, mechanically: this variable has no fallback default in the compose file, so `docker compose up` refuses to start if it is unset or empty, rather than silently running Grafana with its well-known `admin` default password | Staging, Production |
 
 ### 8.1 Environment-Specific Overrides
 
@@ -338,23 +365,78 @@ Because the Escalation Check and Reminder Dispatch jobs (WEDD Section 8.3) query
 
 ### 13.1 The Multi-Instance Problem
 
-APScheduler runs in-process, per the ADD. In a multi-instance deployment (Section 2), every instance shares the same code and would, by default, independently register and run the Escalation Check, Reminder Dispatch, and Nightly Analytics Aggregation jobs — which would cause each job to execute once per instance, per scheduling interval, rather than once overall. The ADD anticipates exactly this and specifies the resolution: "running only on one designated instance... using a simple leader flag in configuration" (ADD Section 10).
+APScheduler runs in-process, per the ADD. In a multi-instance deployment (Section 2), every instance shares the same code and would, by default, independently register and run the Escalation Check (`escalation_check`), Reminder Dispatch (`reminder_dispatch`), and — where Redis-backed jobs are active — Stuck Job Reaper (`stuck_job_reaper`) jobs (`app.bootstrap`) — which would cause each job to execute once per instance, per scheduling interval, rather than once overall.
 
-### 13.2 Leader Designation
+### 13.2 Leader Election
 
-Exactly one application instance per environment is started with `SCHEDULER_LEADER=true` (Section 8); every other instance is started with `SCHEDULER_LEADER=false` and never registers any APScheduler job at all — not a job that runs and no-ops, but a job that is never registered in that instance's process, per the startup sequence in Section 5.4. This is a static, deployment-time designation, not a runtime-elected leadership protocol (e.g., no distributed lock or consensus mechanism is introduced), consistent with this document's constraint against introducing infrastructure beyond the fixed stack.
+`SCHEDULER_LEADER=true` (Section 8) means an instance **participates in the Scheduler pool** — registers its jobs at all — never set on an `app.jobs.worker` process, which consumes the job queue, not the Scheduler. What happens among participating instances depends on whether Redis is configured:
 
-### 13.3 Leader Instance Availability
+- **`REDIS_URL` unset**: the original, static design this document has described since v1 — exactly one participating instance is started with `SCHEDULER_LEADER=true`; every other instance is started with `SCHEDULER_LEADER=false` and never registers any APScheduler job at all. A manual, deployment-time designation, not a runtime-elected protocol — the operator must ensure uniqueness themselves.
+- **`REDIS_URL` set**: leader election is dynamic and self-healing. More than one instance may (and, in the reference production topology, does — `docker-compose.production.yml`'s `backend`/`backend-2`) set `SCHEDULER_LEADER=true`; every one of them registers its jobs and continuously contends for a single shared Redis lock (`app.scheduler.leader_election.LeaderElection`). Whichever instance holds it is the live leader; every other participating instance's ticks are skipped outright (`JobStatistics.skipped_not_leader_count`), never even attempting execution. See `docs/scheduler_distributed_coordination.md` for the full mechanism, including a second, independent per-job Redis lock that guards against duplicate execution even in a theoretical split-brain window.
 
-Because leader designation is static, the leader instance's own availability directly determines whether scheduled jobs run at all during any period it is down. This is an accepted operational trade-off, not an oversight: per WEDD Section 8.6, no scheduled job's correctness depends on continuous execution — every job re-evaluates durable database state fresh on each run, so a missed interval (during a leader instance restart, for example) is fully compensated for by the next successful run, which will simply find a larger batch of eligible stages to act on.
+### 13.3 Leader Instance Availability and Failover
 
-### 13.4 Reassigning Leadership
+- **Without Redis**: leader designation is static, so the leader instance's own availability directly determines whether scheduled jobs run at all during any period it is down — an accepted trade-off, not an oversight, since per WEDD Section 8.6 no scheduled job's correctness depends on continuous execution (every job re-evaluates durable database state fresh on each run, so a missed interval is fully compensated for by the next successful one).
+- **With Redis**: a crashed leader's lock expires automatically within one TTL window (`SCHEDULER_LEADER_LOCK_TTL_SECONDS`, default 30s, Section 8) and another participating instance is elected within roughly a third of that window — automatic failover, no manual step. A gracefully stopped leader (a normal deploy/restart) releases its lock immediately rather than waiting out the TTL.
 
-If the designated leader instance is being taken down for an extended period (e.g., a full redeployment cycle, Section 22), operational procedure is to set `SCHEDULER_LEADER=true` on a different, remaining instance and restart it before the original leader is stopped, ensuring at least one instance always has Scheduler jobs registered during the transition — this is a manual configuration change as part of the deployment runbook, not an automated failover mechanism, consistent with Section 13.2's static-designation design.
+### 13.4 Reassigning Leadership (no-Redis fallback only)
+
+This section applies only when `REDIS_URL` is not set — with Redis configured, failover is automatic (Section 13.3) and this manual procedure is unnecessary. If the designated leader instance is being taken down for an extended period (e.g., a full redeployment cycle, Section 22), operational procedure is to set `SCHEDULER_LEADER=true` on a different, remaining instance and restart it before the original leader is stopped, ensuring at least one instance always has Scheduler jobs registered during the transition.
 
 ### 13.5 Scheduler Verification at Deployment Time
 
-Per TSD Section 9.4 and Section 20 of this document, deployment verification confirms exactly one instance reports its Scheduler as active (via the health/status detail described in Section 15.5) — both that at least one instance has jobs registered (no environment is ever left with escalation and reminders silently not running) and that no more than one does (avoiding duplicate job execution).
+Per TSD Section 9.4 and Section 20 of this document, deployment verification confirms exactly one instance reports its Scheduler as active (via the health/status detail described in Section 15.5) — both that at least one instance reports `scheduler_active: true` (no environment is ever left with escalation and reminders silently not running) and that no more than one does (avoiding duplicate job execution). With Redis-backed election active, this check is self-correcting on every subsequent poll rather than a one-time deployment-time snapshot; the accompanying `scheduler_leader_election` field (`"redis"` or `"static"`) makes which mode is in effect explicit.
+
+### 13.6 Configuration Reference
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `SCHEDULER_LEADER` | Whether this instance participates in the Scheduler pool (13.2) | `false` |
+| `SCHEDULER_ESCALATION_INTERVAL_MINUTES` | Escalation Check interval | `60` |
+| `SCHEDULER_REMINDER_INTERVAL_HOURS` | Reminder Dispatch interval | `24` |
+| `SCHEDULER_LEADER_LOCK_TTL_SECONDS` | Redis leader lock TTL (only meaningful with `REDIS_URL` set) | `30` |
+| `SCHEDULER_JOB_LOCK_TTL_SECONDS` | Redis per-job execution lock TTL (only meaningful with `REDIS_URL` set) — keep comfortably above the slowest registered job's realistic runtime | `300` |
+
+### 13.7 The Job System's Worker Containers (production infrastructure layer)
+
+Distinct from the in-process APScheduler above: the job system (`app.jobs`) is a Redis+Postgres-backed background job queue with retry/exponential-backoff, a dead-letter state, and job priority — the durable record of every job's status/history lives in the `jobs` table (migration `0015_jobs`, `app.database.repositories.job_repository`), while Redis (per-`queue_name`, per-priority ready lists plus a delayed/retry sorted set) is only ever the live dispatch mechanism, never a system of record (Section 16.5).
+
+`docker-compose.production.yml` runs **two** worker roles from the same backend image, differing only in which `queue_name` each consumes (`python -m app.jobs.worker --role default|escalation`):
+
+- **`worker-default`** consumes `send_email` and `send_invitation_email` jobs — enqueued by `NotificationService`'s and `InvitationService`'s email senders when `EMAIL_DISPATCH_MODE=queue` (Section 4/8, requires `REDIS_URL`).
+- **`worker-escalation`** consumes `escalate_stage` and `send_reminder` jobs — enqueued by the Scheduler's Escalation Check and Reminder Dispatch jobs (Sections 13.1–13.5) whenever Redis is configured. **Unlike every other job type**, these two do not require `EMAIL_DISPATCH_MODE=queue` or even a `worker-escalation` container to function at all: when Redis is not configured, `EscalationJob`/`ReminderJob` fall back to executing synchronously, in-process, in the Scheduler leader's own thread (`app.jobs.job_service.SynchronousJobDispatcher`) — byte-for-byte the behavior that existed before the job system was introduced. A `worker-escalation` container only takes over that work (with retry/backoff/dead-letter, and off the Scheduler leader's own thread) once `REDIS_URL` is set.
+
+Like the retired single-worker container, neither role has a leader concept to configure: Redis's per-priority list semantics (`BRPOP`) already guarantee each job is delivered to exactly one consumer, so running more than one replica of either role is safe (throughput scaling, not a correctness concern) — the operational discipline is "run at least one of each role you rely on," not "run exactly one." A `StuckJobReaperJob`, registered on the Scheduler leader alongside Escalation Check/Reminder Dispatch whenever Redis is configured, recovers any job left orphaned by a worker that crashed mid-execution (or a Redis push that failed after its Postgres row was already committed) — see `app.scheduler.stuck_job_reaper_job` for the exact recovery path (the same retry-or-dead-letter transition a worker itself applies on an ordinary handler failure).
+
+With the default `EMAIL_DISPATCH_MODE=direct` and Redis unconfigured, no worker container is needed at all — every job type's dispatch happens synchronously, exactly as before this layer was introduced. Operators can inspect job status/history, retry a dead-lettered job, and manage scheduled jobs (enable/disable/trigger-now) via the admin API (`/api/v1/admin/jobs`, `/api/v1/admin/scheduled-jobs`) and its frontend page (`/admin/jobs`) — see `docs/job_system_migration.md` for upgrade notes.
+
+### 13.8 Platform Administration Module
+
+Company (tenant) management — create/suspend/delete, per-tenant settings and license metadata, platform-wide statistics/health/audit history — is gated by `profiles.is_platform_admin`, a capability orthogonal to the ordinary `UserRole.ADMIN` company-scoped role (`app.auth.authorization.authorize_platform_admin`). There is no self-service way to become a platform admin; an operator promotes the first one directly against the database:
+
+```sql
+update public.profiles set is_platform_admin = true where id = '<profile-id>';
+```
+
+Requires migration `0017_platform_admin` (companies' soft-delete/settings columns, `company_licenses`, `feature_flags`). Suspending a company (`is_active=false`) takes effect immediately — every user in it is rejected on their very next authenticated request (`app.auth.supabase_verifier.SupabaseTokenVerifier`), not just at next login; deleting one is a soft-delete (data retained, reversible via restore). Feature flags and per-company license limits are informational/platform-admin-managed only in this baseline — nothing in the application enforces them yet. See `docs/platform_administration.md` for the full endpoint reference and operator notes.
+
+### 13.9 Enterprise-Wide Search
+
+Cross-entity search (`GET /api/v1/search`, `app.services.search_service.GlobalSearchService`) spans requests, approvals, workflow definitions, users, departments, comments, notifications, attachments, and audit entries — each already scoped by the same role/tenant authorization the rest of the application enforces (no new visibility rule is introduced by search itself). Requires migrations `0018_search_indexes` (`pg_trgm` extension, trigram GIN indexes on every searchable text column, generated `tsvector` columns + GIN indexes on `requests`/`comments` for true full-text ranking) and `0019_saved_search` (`saved_filters`, `search_history` — per-user, per-company, RLS-protected). `create extension if not exists pg_trgm;` requires the extension be enabled on the target Postgres instance (already true by default on Supabase). See `docs/enterprise_search.md` for the full endpoint reference, indexing rationale, and data model.
+
+### 13.10 AI Integration
+
+AI-generated summaries, recommendations, and a dashboard assistant (`GET/POST /api/v1/ai/*`, `app.services.ai_insight_service.AiInsightService`) are strictly opt-in and require **no migration** — with `AI_PROVIDER` unset (the default in every environment), the application behaves byte-for-byte as it did before this layer was introduced, and every `/ai/*` endpoint returns a deterministic, non-AI fallback instead of erroring. To enable it, set:
+
+| Variable | Required when enabled | Notes |
+|---|---|---|
+| `AI_PROVIDER` | — | `openai` or `anthropic`; unset disables every AI feature |
+| `AI_API_KEY` | Yes, if `AI_PROVIDER` is set | The provider's API key |
+| `AI_MODEL` | Yes, if `AI_PROVIDER` is set | No default is guessed — model identifiers go stale, so an operator enabling this feature chooses one explicitly |
+| `AI_TIMEOUT_SECONDS` | No (default `20`) | Per-call request timeout |
+| `AI_MAX_OUTPUT_TOKENS` | No (default `600`) | Upper bound on generated response length |
+
+Setting `AI_PROVIDER` to anything other than `openai`/`anthropic`, or setting it without `AI_API_KEY`/`AI_MODEL`, fails application startup (`InvalidConfigurationValueError`/`MissingEnvironmentVariableError`) — a provider is never constructed from partial configuration. See `docs/ai_integration.md` for the full endpoint reference, provider abstraction, caching, and fallback design.
 
 ---
 
@@ -400,20 +482,31 @@ Per the ADD and DSD, operational logs (this section) and `audit_logs` (DSD Secti
 
 ### 15.1 Monitoring Philosophy
 
-Consistent with API-ADD Section 27, EAH's monitoring surface is deliberately lightweight: structured logs (Section 14), the latency and rate-limit figures already specified in the API-ADD, and a health endpoint — no dedicated metrics-collection or distributed-tracing platform is introduced, since none is part of the fixed stack.
+Consistent with API-ADD Section 27, EAH's baseline monitoring surface is structured logs (Section 14), the latency and rate-limit figures already specified in the API-ADD, and a health endpoint. As of the production infrastructure layer (Version 2.0), this is complemented by a Prometheus metrics endpoint and an optional Grafana dashboard (Section 15.6) — still deliberately lightweight (request counts/latency/rate-limit rejections only, no distributed tracing) rather than a full APM platform.
+
+One narrow, entirely optional exception (Milestone 13): setting `SENTRY_DSN` initializes Sentry error tracking (`app/config/error_tracking.py`) at startup, reporting unhandled exceptions from both the API and the Scheduler's jobs. Unset — the default, and the only configuration every deployment has had until now — this performs no initialization, no network call, and no behavior change of any kind; Sentry's separate Performance Tracing feature is explicitly disabled (`traces_sample_rate=0.0`) even when a DSN is configured, keeping this scoped to error capture only, not a distributed-tracing platform.
 
 ### 15.2 Health Endpoint
 
-`GET /api/v1/health` (API-ADD Section 27) is the primary automated monitoring surface: unauthenticated, returning `200 { "status": "ok" }` when the instance can reach its Supabase connection. The load balancer (Section 2) uses this endpoint to determine whether to route traffic to a given instance.
+`GET /api/v1/health` (API-ADD Section 27) is the primary automated monitoring surface: unauthenticated, returning `200 { "status": "ok" }` when the instance can reach its Supabase connection (and Redis, if configured). The load balancer (Section 2) uses this endpoint to determine whether to route traffic to a given instance.
+
+As of the production infrastructure layer, this single check is complemented by two narrower, container-orchestrator-facing probes (`app.api.routers.health`), matching the standard liveness/readiness split:
+
+- **`GET /api/v1/health/live`** — no dependency check at all; reports only that the process itself is running. Used by each container's own `HEALTHCHECK` (`Dockerfile`, `frontend/Dockerfile`) — a transient Supabase/Redis outage must never cause a healthy container to be killed and restarted, since that would not fix the outage and only churns the fleet.
+- **`GET /api/v1/health/ready`** — the same Supabase-reachability (and optional Redis) check `GET /api/v1/health` always performed, under its own dedicated path for an orchestrator's readiness probe.
+
+`GET /api/v1/health` itself is unchanged and remains the load balancer's own check (Section 2) — the two narrower probes above are additive, not a replacement.
 
 ### 15.3 What Is Monitored
 
 | Signal | Source | Threshold / Expectation |
 |---|---|---|
-| Instance health | `GET /api/v1/health` | `200` expected continuously; sustained failure removes the instance from the load balancer's rotation |
-| Request latency | Structured logs (`duration_ms`), aggregated per the API-ADD's stated targets (API-ADD Section 25.2) | p95 < 150 ms (single-resource reads), < 300 ms (filtered lists), < 400 ms (mutating transactions) |
-| Rate-limit rejections | Structured logs (`429` outcomes) | A sustained spike may indicate abuse or a misbehaving client, per API-ADD Section 15 |
-| Scheduler job execution | Structured logs (`component: EscalationCheck` / `ReminderDispatch` / `NightlyAnalyticsAggregation`) | Each job logs its own start, completion, and batch size on every run; an absent log entry for a configured interval indicates the leader instance (Section 13) is down |
+| Instance health | `GET /api/v1/health` (or `/health/ready`) | `200` expected continuously; sustained failure removes the instance from the load balancer's rotation |
+| Container liveness | `GET /api/v1/health/live`, `GET /api/health` (frontend) | `200` expected continuously; sustained failure indicates a container-level restart is warranted |
+| Request latency | Structured logs (`duration_ms`) and `eah_http_request_duration_seconds` (Prometheus, Section 15.6), aggregated per the API-ADD's stated targets (API-ADD Section 25.2) | p95 < 150 ms (single-resource reads), < 300 ms (filtered lists), < 400 ms (mutating transactions) |
+| Rate-limit rejections | Structured logs (`429` outcomes) and `eah_rate_limit_rejections_total` (Prometheus) | A sustained spike may indicate abuse or a misbehaving client, per API-ADD Section 15 |
+| Scheduler job execution | Structured logs (job name `escalation_check` / `reminder_dispatch` / `stuck_job_reaper`) | Each job logs its own start, completion, and batch size on every run; an absent log entry for a configured interval indicates the leader instance (Section 13) is down |
+| Job system queue depth/consumption | `worker-default`/`worker-escalation` container logs (Section 13.7); `eah_job_queue_depth`/`eah_job_delayed_count`/`eah_job_dead_letter_count` (Prometheus, Section 15.6); `/api/v1/admin/jobs/stats/summary` | An absent "Job ... succeeded/retrying/dead_lettered" log entry over a sustained period with jobs enqueued indicates the corresponding worker role isn't running; a growing `eah_job_dead_letter_count` warrants operator inspection via `/admin/jobs/dead-letter` |
 | Database-observable metrics | Supabase's own project dashboard (connection count, query performance) | No separate database-monitoring tool is introduced; Supabase's native tooling is the sole source for this signal |
 
 ### 15.4 Monitoring Flow Diagram
@@ -439,7 +532,32 @@ flowchart TB
 
 ### 15.5 Instance-Level Scheduler Status
 
-The health endpoint's response, per API-ADD Section 27, may be extended (within the existing `data` object, additively per API-ADD Section 5.2) to include whether this specific instance is the Scheduler leader (`scheduler_active: true|false`), giving operators a direct way to confirm exactly one instance reports `true` at any time (Section 13.5), without introducing a separate monitoring surface.
+The health endpoint's response includes whether this specific instance is the Scheduler leader (`scheduler_active: true|false`), giving operators a direct way to confirm exactly one instance reports `true` at any time (Section 13.5), without introducing a separate monitoring surface: poll `GET /api/v1/health` across every instance in the fleet and alert if the count of `scheduler_active: true` responses is ever `0` (no escalation/reminder jobs are running) or `>1` (duplicate escalation/reminder notifications are likely, Section 23's troubleshooting table).
+
+### 15.6 Prometheus and Grafana (production infrastructure layer)
+
+`GET /metrics` (unauthenticated, mounted at the application root, not under `/api/v1` — matching Prometheus's own default scrape convention) exposes the following application metrics (`app.observability.metrics`), plus the Python process metrics `prometheus_client` registers by default:
+
+| Metric | Type | Labels |
+|---|---|---|
+| `eah_http_requests_total` | Counter | `method`, `path_template`, `status_code` |
+| `eah_http_request_duration_seconds` | Histogram | `method`, `path_template` |
+| `eah_rate_limit_rejections_total` | Counter | (none) |
+| `eah_job_queue_depth` | Gauge | `queue_name`, `priority` — refreshed from Redis at scrape time |
+| `eah_job_delayed_count` | Gauge | `queue_name` — refreshed from Redis at scrape time |
+| `eah_job_dead_letter_count` | Gauge | `queue_name` — refreshed from Postgres at scrape time |
+
+`path_template` is always the route's *templated* path (e.g. `/requests/{request_id}`), never a raw resource id — an unbounded label value per distinct resource ever requested is exactly the label-cardinality explosion Prometheus's own documentation warns against. Controlled by `METRICS_ENABLED` (Section 8), defaulting to `true`.
+
+Each `worker-default`/`worker-escalation` container additionally runs its **own** small Prometheus HTTP server (`WORKER_METRICS_PORT`, default `9100`) — workers have no other HTTP server to expose these through, unlike the backend's `/metrics`:
+
+| Metric | Type | Labels |
+|---|---|---|
+| `eah_jobs_processed_total` | Counter | `task_type`, `outcome` (`succeeded`/`retrying`/`dead_lettered`) |
+| `eah_job_duration_seconds` | Histogram | `task_type` |
+| `eah_worker_up` | Gauge | `worker_id`, `role` — `1` while the worker is running, `0` once it shuts down |
+
+`docker-compose.production.yml`'s `prometheus` service scrapes `backend:8000/metrics` and both worker containers' `:9100/metrics` per `deploy/prometheus/prometheus.yml`; its `grafana` service auto-provisions that Prometheus instance as a datasource and a starter dashboard (`deploy/grafana/dashboards/eah-overview.json`) — request rate, p95 latency, error rate, and rate-limit rejections — on container startup (`deploy/grafana/provisioning`), needing no manual "add data source"/"import dashboard" click-through. Both services are optional infrastructure: omitting them from a deployment does not affect the backend's own behavior, since the backend never depends on anything scraping `/metrics`.
 
 ---
 
@@ -453,7 +571,7 @@ Per DSD Section 13.1, EAH relies entirely on Supabase's built-in automated daily
 
 | Data | Mechanism |
 |---|---|
-| PostgreSQL data (`requests`, `workflow_stages`, `comments`, `attachments` metadata, `notifications`, `audit_logs`, `workflow_definitions`, `profiles`) | Supabase's automated daily database backup |
+| PostgreSQL data (`requests`, `workflow_stages`, `comments`, `attachments` metadata, `notifications`, `audit_logs`, `workflow_definitions`, `profiles`, `jobs`) | Supabase's automated daily database backup |
 | Supabase Storage objects (attachment files) | Supabase's own Storage durability/replication, per its managed service guarantees |
 | Application configuration (environment variables) | Held in the hosting platform's own configuration/secret store (Section 9), backed up as part of that platform's own operational practice, outside this document's scope |
 | Application code | Version control (source repository), not a "backup" in the database sense — redeployment from the repository is the recovery mechanism (Section 22) |
@@ -475,6 +593,10 @@ flowchart TD
 ### 16.4 Backup Verification
 
 Because every write in EAH is transactional (DSD Section 11), a Supabase backup or PITR restore point is always internally consistent — there is no scenario in which a restored snapshot reflects a half-committed transaction, per the DSD's own reasoning (DSD Section 13.2). This document adds the operational practice of periodically confirming a restore is actually usable: restoring to a disposable, non-production project on a scheduled cadence and running a subset of TSD's database-integrity tests (TSD Section 6.6) against the restored copy, rather than trusting backup completion alone as evidence of restorability.
+
+### 16.5 Redis Persistence (production infrastructure layer — not a backup)
+
+Where Redis is configured (Section 4), `docker-compose.production.yml` enables append-only-file (AOF) persistence (`--appendonly yes`) with data written to a named Docker volume (`redis_data`), so an ordinary container restart does not silently discard jobs waiting to be dispatched. This is **not** part of this document's backup strategy: every value Redis holds — rate-limit counters, the short-TTL (15s) analytics response cache, and each job's ephemeral live-dispatch pointer (`{"job_id", "priority"}`, per `app.jobs.redis_queue`) — is either trivially reconstructable (counters/cache, from the next request) or a duplicate of information already durably recorded in Supabase: a job's actual status/payload/attempt history lives exclusively in the `jobs` table, so losing its Redis pointer only delays dispatch (recovered by `StuckJobReaperJob`, Section 13.7), never loses the job's own record. Losing the `redis_data` volume entirely (a fresh Redis instance with an empty dataset) degrades service in the same way Redis being unconfigured always has — no data loss occurs against the system of record — so no scheduled backup or PITR is configured for it, consistent with this document's "no independent redundancy beyond Supabase for durable state" principle (Section 17.1) applying equally to a component that was never durable state to begin with.
 
 ---
 
@@ -524,7 +646,7 @@ Per the DSD's forward-only migration philosophy (DSD Section 15), a migration is
 | 3 | If a migration was involved and a downgrade path exists, apply it before redeploying the previous application version |
 | 4 | If a migration was involved and no downgrade path exists, author and test a new, forward corrective migration before redeploying (never edit the original migration) |
 | 5 | Re-run the Production Verification Checklist (Section 20) against the rolled-back state before resuming full traffic |
-| 6 | Confirm exactly one instance retains `SCHEDULER_LEADER=true` after the rollback (Section 13.5) |
+| 6 | Confirm exactly one instance reports `scheduler_active: true` after the rollback (Section 13.5) |
 | 7 | Record the rollback and its cause in the deployment history, per Section 21's maintenance record-keeping |
 
 ### 18.4 Workflow-Specific Rollback Considerations
@@ -578,6 +700,9 @@ This checklist extends TSD Section 18 with deployment-specific verification, exe
 | Logging | Structured log output confirmed flowing to the hosting platform's log aggregation (Section 14.3) |
 | Backups | Automated daily backup confirmed enabled on the target Supabase project; PITR confirmed enabled where the tier supports it (Section 16) |
 | Rate Limiting | Confirmed enforced at the configured thresholds (Section 19.5) |
+| Images | Backend/frontend images for the exact commit being deployed published to GHCR by `cd.yml` (Section 4); `docker compose config` validated against the target `.env` |
+| Redis / Job System (if configured) | `GET /api/v1/health/ready`'s `redis`/`job_queue` fields report `"ok"`; at least one `worker-default` and one `worker-escalation` container running and healthy (Section 13.7); `/api/v1/admin/jobs/stats/summary` reachable |
+| Metrics | Prometheus's `eah-backend` and `eah-worker` scrape targets report `UP`; Grafana's provisioned dashboard renders data (Section 15.6) |
 | Test Suite | Full TSD Section 13.1 CI pipeline passed for the exact commit being deployed |
 | Acceptance | TSD Section 16 acceptance scenarios re-confirmed against staging prior to production promotion |
 | Rollback Readiness | A tested rollback path (Section 18) documented and confirmed available for this specific release before promotion |

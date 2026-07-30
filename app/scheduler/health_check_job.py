@@ -13,9 +13,13 @@ from __future__ import annotations
 import logging
 import threading
 
+from app.scheduler.interfaces import (
+    ExecutionContext,
+    ExecutionResult,
+    JobStatistics,
+    SchedulerStatisticsProvider,
+)
 from app.utils.datetime_utils import utc_now
-
-from app.scheduler.interfaces import ExecutionContext, ExecutionResult, JobStatistics, SchedulerStatisticsProvider
 
 __all__ = ["JobHealthStatus", "SchedulerHealthSnapshot", "HealthCheckJob"]
 

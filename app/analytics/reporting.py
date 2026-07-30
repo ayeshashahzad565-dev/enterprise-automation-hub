@@ -58,11 +58,16 @@ class ReportingEngine:
         self._logger = logging.getLogger(f"{__name__}.ReportingEngine")
 
     def build_executive_summary(
-        self, *, created_after: datetime | None = None, created_before: datetime | None = None
+        self,
+        *,
+        company_id: UUID,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
     ) -> AnalyticsSummary:
-        """Build a high-level, organization-wide summary.
+        """Build a high-level, company-wide summary.
 
         Args:
+            company_id: Restricts every figure to this company (tenant).
             created_after: Restrict to activity at or after this
                 timestamp, if provided.
             created_before: Restrict to activity at or before this
@@ -78,9 +83,10 @@ class ReportingEngine:
         """
         try:
             dashboard = self._analytics.get_dashboard_metrics(
-                created_after=created_after, created_before=created_before
+                company_id=company_id, created_after=created_after, created_before=created_before
             )
             trend = self._analytics.get_request_trend(
+                company_id=company_id,
                 granularity=TimeGranularity.MONTH,
                 created_after=created_after,
                 created_before=created_before,
@@ -105,11 +111,16 @@ class ReportingEngine:
         )
 
     def build_operational_summary(
-        self, *, created_after: datetime | None = None, created_before: datetime | None = None
+        self,
+        *,
+        company_id: UUID,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
     ) -> AnalyticsSummary:
         """Build a day-to-day operational summary.
 
         Args:
+            company_id: Restricts every figure to this company (tenant).
             created_after: Restrict to activity at or after this
                 timestamp, if provided.
             created_before: Restrict to activity at or before this
@@ -125,9 +136,10 @@ class ReportingEngine:
         """
         try:
             dashboard = self._analytics.get_dashboard_metrics(
-                created_after=created_after, created_before=created_before
+                company_id=company_id, created_after=created_after, created_before=created_before
             )
             trend = self._analytics.get_request_trend(
+                company_id=company_id,
                 granularity=TimeGranularity.DAY,
                 created_after=created_after,
                 created_before=created_before,
@@ -156,13 +168,15 @@ class ReportingEngine:
         self,
         request_type: str,
         *,
+        company_id: UUID,
         created_after: datetime | None = None,
         created_before: datetime | None = None,
     ) -> AnalyticsSummary:
-        """Build a summary scoped to a single request type.
+        """Build a summary scoped to a single request type within a company.
 
         Args:
             request_type: The request type to summarize.
+            company_id: Restricts every figure to this company (tenant).
             created_after: Restrict to activity at or after this
                 timestamp, if provided.
             created_before: Restrict to activity at or before this
@@ -178,9 +192,13 @@ class ReportingEngine:
         """
         try:
             workflow_metrics = self._analytics.get_workflow_metrics(
-                request_type, created_after=created_after, created_before=created_before
+                request_type,
+                company_id=company_id,
+                created_after=created_after,
+                created_before=created_before,
             )
             trend = self._analytics.get_request_trend(
+                company_id=company_id,
                 granularity=TimeGranularity.WEEK,
                 request_type=request_type,
                 created_after=created_after,
@@ -209,13 +227,15 @@ class ReportingEngine:
         self,
         department: str,
         *,
+        company_id: UUID,
         created_after: datetime | None = None,
         created_before: datetime | None = None,
     ) -> AnalyticsSummary:
-        """Build a summary scoped to a single department.
+        """Build a summary scoped to a single department within a company.
 
         Args:
             department: The department to summarize.
+            company_id: Restricts every figure to this company (tenant).
             created_after: Restrict to activity at or after this
                 timestamp, if provided.
             created_before: Restrict to activity at or before this
@@ -231,9 +251,13 @@ class ReportingEngine:
         """
         try:
             department_metrics = self._analytics.get_department_metrics(
-                department, created_after=created_after, created_before=created_before
+                department,
+                company_id=company_id,
+                created_after=created_after,
+                created_before=created_before,
             )
             trend = self._analytics.get_request_trend(
+                company_id=company_id,
                 granularity=TimeGranularity.WEEK,
                 department=department,
                 created_after=created_after,
@@ -257,11 +281,14 @@ class ReportingEngine:
             narrative=narrative,
         )
 
-    def build_user_summary(self, user_id: UUID) -> AnalyticsSummary:
-        """Build a summary scoped to a single user.
+    def build_user_summary(self, user_id: UUID, *, company_id: UUID) -> AnalyticsSummary:
+        """Build a summary scoped to a single user within a company.
 
         Args:
             user_id: The user's id.
+            company_id: The caller's own company (tenant); see
+                ``AnalyticsProvider.get_user_metrics`` for how an
+                out-of-company ``user_id`` is handled.
 
         Returns:
             An ``AnalyticsSummary`` with ``user_metrics`` populated.
@@ -271,7 +298,7 @@ class ReportingEngine:
                 fails.
         """
         try:
-            user_metrics = self._analytics.get_user_metrics(user_id)
+            user_metrics = self._analytics.get_user_metrics(user_id, company_id=company_id)
         except Exception as exc:  # noqa: BLE001 - translated into a typed error below
             raise ReportingError(f"Failed to build user summary for {user_id}: {exc}") from exc
 

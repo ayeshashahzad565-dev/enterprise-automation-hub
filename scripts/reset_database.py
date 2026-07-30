@@ -175,7 +175,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--email", default=None, help="Admin email for --seed (forwarded to seed_demo_data.py)."
     )
     parser.add_argument(
-        "--password", default=None, help="Admin password for --seed (forwarded to seed_demo_data.py)."
+        "--password",
+        default=None,
+        help="Admin password for --seed (forwarded to seed_demo_data.py).",
     )
     parser.add_argument(
         "--full-name",

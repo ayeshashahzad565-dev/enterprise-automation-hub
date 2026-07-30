@@ -11,16 +11,19 @@ only) that the DSD assigns to the application's database role.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 from uuid import UUID
 
 from app.database.client import DatabaseClient
+from app.database.exceptions import InvalidQueryError
 from app.database.repositories.base_repository import (
     BaseRepository,
     Page,
     PagedResult,
+    escape_ilike_special_characters,
     parse_datetime,
     parse_uuid,
 )
@@ -44,6 +47,9 @@ class AuditLogRecord:
         metadata: A structured snapshot of relevant fields at the time of
             the action, if any.
         created_at: The timestamp the action occurred.
+        company_id: The company (tenant) this event belongs to, if any —
+            nullable, since a genuinely platform-level event (e.g. a
+            company's own creation) has no single owning company.
     """
 
     id: UUID
@@ -52,6 +58,7 @@ class AuditLogRecord:
     action: str
     metadata: dict[str, Any] | None
     created_at: datetime
+    company_id: UUID | None
 
 
 def _map_audit_log_row(row: dict[str, Any]) -> AuditLogRecord:
@@ -63,6 +70,7 @@ def _map_audit_log_row(row: dict[str, Any]) -> AuditLogRecord:
         action=row["action"],
         metadata=row.get("metadata"),
         created_at=parse_datetime(row["created_at"]),  # type: ignore[arg-type]
+        company_id=parse_uuid(row.get("company_id")),
     )
 
 
@@ -77,8 +85,8 @@ class AuditRepository(BaseRepository[AuditLogRecord]):
 
     table_name = "audit_logs"
 
-    def __init__(self, client: DatabaseClient) -> None:
-        super().__init__(client)
+    def __init__(self, client: DatabaseClient, *, always_use_injected_client: bool) -> None:
+        super().__init__(client, always_use_injected_client=always_use_injected_client)
 
     def record_event(
         self,
@@ -87,6 +95,7 @@ class AuditRepository(BaseRepository[AuditLogRecord]):
         actor_id: UUID | None = None,
         request_id: UUID | None = None,
         metadata: dict[str, Any] | None = None,
+        company_id: UUID | None = None,
     ) -> AuditLogRecord:
         """Insert a new, immutable audit log entry.
 
@@ -121,6 +130,7 @@ class AuditRepository(BaseRepository[AuditLogRecord]):
             "request_id": str(request_id) if request_id else None,
             "action": action,
             "metadata": metadata,
+            "company_id": str(company_id) if company_id else None,
         }
         return self.insert(values, mapper=_map_audit_log_row)
 
@@ -156,12 +166,12 @@ class AuditRepository(BaseRepository[AuditLogRecord]):
         Returns:
             A ``PagedResult`` of the request's audit entries.
         """
-        builder = self._query().eq("request_id", str(request_id)).order("created_at")
+        builder = (
+            self._select("*", count="exact").eq("request_id", str(request_id)).order("created_at")
+        )
         return self.paginate(builder, page, mapper=_map_audit_log_row)
 
-    def list_for_actor(
-        self, actor_id: UUID, *, page: Page = Page()
-    ) -> PagedResult[AuditLogRecord]:
+    def list_for_actor(self, actor_id: UUID, *, page: Page = Page()) -> PagedResult[AuditLogRecord]:
         """List the audit entries authored by a specific user.
 
         Backed by the index on ``actor_id`` (DSD Section 10.1).
@@ -173,26 +183,35 @@ class AuditRepository(BaseRepository[AuditLogRecord]):
         Returns:
             A ``PagedResult`` of matching audit entries.
         """
-        builder = self._query().eq("actor_id", str(actor_id)).order("created_at", desc=True)
+        builder = (
+            self._select("*", count="exact")
+            .eq("actor_id", str(actor_id))
+            .order("created_at", desc=True)
+        )
         return self.paginate(builder, page, mapper=_map_audit_log_row)
 
     def list_all(
         self,
         *,
+        company_id: UUID,
         actor_id: UUID | None = None,
         action: str | None = None,
         created_after: datetime | None = None,
         created_before: datetime | None = None,
         page: Page = Page(),
     ) -> PagedResult[AuditLogRecord]:
-        """Organization-wide audit search.
+        """Company-wide audit search.
 
         Corresponds to ``GET /api/v1/audit-logs`` (API-ADD Section
         19.10.2), an administrator-only operation at the Application
         Layer and RLS level — this repository applies only the explicit
-        filters requested.
+        filters requested. ``company_id`` is required (not optional):
+        "organization-wide" means "this admin's own company," never the
+        whole platform — a row with no ``company_id`` (a genuinely
+        platform-level event) is never returned by this method.
 
         Args:
+            company_id: Restricts results to this company (tenant).
             actor_id: Restrict to entries authored by this user, if
                 provided.
             action: Restrict to this action code, if provided.
@@ -205,7 +224,7 @@ class AuditRepository(BaseRepository[AuditLogRecord]):
         Returns:
             A ``PagedResult`` of matching audit entries.
         """
-        builder = self._query()
+        builder = self._scoped_query(company_id=company_id)
         if actor_id is not None:
             builder = builder.eq("actor_id", str(actor_id))
         if action is not None:
@@ -214,5 +233,96 @@ class AuditRepository(BaseRepository[AuditLogRecord]):
             builder = builder.gte("created_at", created_after.isoformat())
         if created_before is not None:
             builder = builder.lte("created_at", created_before.isoformat())
+        builder = builder.order("created_at", desc=True)
+        return self.paginate(builder, page, mapper=_map_audit_log_row)
+
+    def list_platform_wide(
+        self,
+        *,
+        company_id: UUID | None = None,
+        actor_id: UUID | None = None,
+        action: str | None = None,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+        page: Page = Page(),
+    ) -> PagedResult[AuditLogRecord]:
+        """Platform-wide audit search, across every tenant.
+
+        Distinct from ``list_all`` (which hard-requires a ``company_id``,
+        scoping "organization-wide" to exactly one company): this method
+        is the one deliberate cross-tenant exception, for the Platform
+        Administration module's audit history and activity timeline —
+        when ``company_id`` is left ``None``, no company filter is
+        applied at all, matching ``CompanyRepository``'s own "no scoping
+        enforced here, gated at the Application Layer" precedent.
+        Enforcement that only a platform admin may call this with
+        ``company_id=None`` lives entirely at the Application Layer
+        (``authorize_platform_admin``), never here.
+
+        Args:
+            company_id: Restrict to this one company, if provided;
+                ``None`` (the default) spans every tenant.
+            actor_id: Restrict to entries authored by this user, if
+                provided.
+            action: Restrict to this action code, if provided.
+            created_after: Restrict to entries at or after this
+                timestamp, if provided.
+            created_before: Restrict to entries at or before this
+                timestamp, if provided.
+            page: The page to retrieve, newest first.
+
+        Returns:
+            A ``PagedResult`` of matching audit entries.
+        """
+        # tenant-scope-exempt: deliberate cross-tenant platform-admin read when company_id
+        # is None (authorization enforced at the Application Layer), see docstring above.
+        builder = self._select("*", count="exact")
+        if company_id is not None:
+            builder = builder.eq("company_id", str(company_id))
+        if actor_id is not None:
+            builder = builder.eq("actor_id", str(actor_id))
+        if action is not None:
+            builder = builder.eq("action", action)
+        if created_after is not None:
+            builder = builder.gte("created_at", created_after.isoformat())
+        if created_before is not None:
+            builder = builder.lte("created_at", created_before.isoformat())
+        builder = builder.order("created_at", desc=True)
+        return self.paginate(builder, page, mapper=_map_audit_log_row)
+
+    def search(
+        self,
+        query_text: str,
+        *,
+        request_ids: Sequence[UUID] | None = None,
+        page: Page = Page(),
+    ) -> PagedResult[AuditLogRecord]:
+        """Free-text search across audit action codes.
+
+        Matches case-insensitively against the fixed ``action`` code (e.g.
+        ``"REQUEST_CREATED"``) — ``metadata`` (JSONB) is not searched,
+        consistent with every other method on this repository, none of
+        which query into JSONB fields either.
+
+        Args:
+            query_text: The search term.
+            request_ids: Restrict to entries for exactly this set of
+                requests, if provided. The caller (``GlobalSearchService``)
+                is responsible for computing an already-authorized set —
+                this repository performs no visibility scoping of its own.
+            page: The page to retrieve, newest first.
+
+        Returns:
+            A ``PagedResult`` of matching audit entries.
+
+        Raises:
+            InvalidQueryError: If ``query_text`` is empty or whitespace-only.
+        """
+        if not query_text or not query_text.strip():
+            raise InvalidQueryError("search requires a non-empty query_text.")
+        pattern = f"%{escape_ilike_special_characters(query_text.strip())}%"
+        builder = self._select("*", count="exact").ilike("action", pattern)
+        if request_ids is not None:
+            builder = builder.in_("request_id", [str(i) for i in request_ids])
         builder = builder.order("created_at", desc=True)
         return self.paginate(builder, page, mapper=_map_audit_log_row)

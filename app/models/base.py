@@ -28,7 +28,7 @@ This module centralizes:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -49,8 +49,8 @@ def _serialize_utc_datetime(value: datetime) -> str:
     Returns:
         An ISO-8601 string such as ``"2026-07-08T14:32:00Z"``.
     """
-    aware_value = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-    return aware_value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    aware_value = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    return aware_value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 #: A datetime field type that always serializes to the API-ADD's

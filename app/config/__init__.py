@@ -61,6 +61,7 @@ from app.config.paths import (
 )
 from app.config.security import (
     ALLOWED_ATTACHMENT_CONTENT_TYPES,
+    ATTACHMENTS_STORAGE_BUCKET,
     AUTHORIZATION_HEADER_NAME,
     BEARER_AUTH_SCHEME,
     MAX_ATTACHMENT_SIZE_BYTES,
@@ -71,11 +72,11 @@ from app.config.security import (
 )
 from app.config.settings import (
     AppSettings,
+    InvitationSettings,
     LoggingSettings,
     RateLimitSettings,
     SchedulerSettings,
     SmtpSettings,
-    StreamlitSettings,
     WorkflowSettings,
     load_settings,
 )
@@ -115,6 +116,7 @@ __all__ = [
     "resolve_within_project",
     # security
     "ALLOWED_ATTACHMENT_CONTENT_TYPES",
+    "ATTACHMENTS_STORAGE_BUCKET",
     "AUTHORIZATION_HEADER_NAME",
     "BEARER_AUTH_SCHEME",
     "MAX_ATTACHMENT_SIZE_BYTES",
@@ -124,11 +126,11 @@ __all__ = [
     "redact_secret",
     # settings
     "AppSettings",
+    "InvitationSettings",
     "LoggingSettings",
     "RateLimitSettings",
     "SchedulerSettings",
     "SmtpSettings",
-    "StreamlitSettings",
     "WorkflowSettings",
     "load_settings",
 ]

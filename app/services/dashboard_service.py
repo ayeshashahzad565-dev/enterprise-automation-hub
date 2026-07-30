@@ -102,17 +102,15 @@ class DashboardService:
         Returns:
             A ``DashboardSummary`` DTO ready for presentation.
         """
-        recent_page = self._request_service.list_requests(
-            identity, page=Page(page=1, page_size=5)
-        )
+        recent_page = self._request_service.list_requests(identity, page=Page(number=1, size=5))
         open_requests_result = self._request_service.list_requests(
-            identity, page=Page(page=1, page_size=1)
+            identity, page=Page(number=1, size=1)
         )
 
         pending_approvals_count = 0
         if identity.role in (UserRole.APPROVER, UserRole.ADMIN):
             pending_page = self._approval_service.list_pending_approvals(
-                identity, page=Page(page=1, page_size=1)
+                identity, page=Page(number=1, size=1)
             )
             pending_approvals_count = pending_page.total_records
 

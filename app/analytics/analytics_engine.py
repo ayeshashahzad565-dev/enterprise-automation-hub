@@ -29,8 +29,9 @@ default, estimated, or partially-scoped value.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Sequence
 from datetime import datetime
-from typing import Callable, TypeVar
+from typing import TypeVar
 from uuid import UUID
 
 from app.analytics import aggregations, metrics
@@ -43,19 +44,23 @@ from app.analytics.dto import (
     UserMetrics,
     WorkflowMetrics,
 )
-from app.analytics.exceptions import InvalidTimeRangeError, MetricCalculationError
+from app.analytics.exceptions import MetricCalculationError, validate_date_range
 from app.database.exceptions import DatabaseError, RecordNotFoundError
 from app.database.repositories.analytics_repository import AnalyticsRepository
+from app.database.repositories.approval_repository import ApprovalRepository
 from app.database.repositories.audit_repository import AuditRepository
 from app.database.repositories.base_repository import Page, PagedResult
-from app.database.repositories.approval_repository import ApprovalRepository
 from app.database.repositories.notification_repository import NotificationRepository
 from app.database.repositories.request_repository import RequestRepository
 from app.database.repositories.user_repository import ProfileRepository
-from app.database.repositories.workflow_repository import WorkflowStageRepository
+from app.database.repositories.workflow_repository import (
+    WorkflowStageRecord,
+    WorkflowStageRepository,
+)
 from app.models import ApprovalThroughput, StatusBreakdown
 from app.models.enums import AuditAction, UserRole
-from app.utils.datetime_utils import seconds_between, utc_now
+from app.utils.cache import ResponseCache, TTLCache, cached_method
+from app.utils.datetime_utils import utc_now
 
 __all__ = ["AnalyticsEngine"]
 
@@ -94,6 +99,8 @@ class AnalyticsEngine:
         profile_repo: ProfileRepository,
         audit_repo: AuditRepository,
         notification_repo: NotificationRepository,
+        cache_ttl_seconds: float = 0.0,
+        response_cache: ResponseCache | None = None,
     ) -> None:
         """Initialize the engine with its injected repositories.
 
@@ -113,6 +120,25 @@ class AnalyticsEngine:
                 supports an organization-wide reminder count without
                 iterating every recipient individually (see
                 ``ApprovalMetrics.reminder_count``).
+            cache_ttl_seconds: How long each public method's result is
+                memoized for (``app.utils.cache.cached_method``), keyed
+                by its own arguments — absorbs concurrent/duplicate
+                dashboard requests within this window without serving
+                meaningfully stale figures. Defaults to ``0`` (caching
+                disabled, this class's original always-recompute
+                behavior) so every existing caller/test sees no change
+                unless it opts in; ``app.bootstrap`` passes a real,
+                positive value for the production-wired instance.
+            response_cache: An already-constructed cache backend to use
+                instead of building a private in-process ``TTLCache``.
+                ``app.bootstrap`` passes a shared
+                ``app.utils.redis_cache.RedisCache`` here when
+                ``AppSettings.redis.enabled`` — a multi-instance
+                deployment then shares one analytics cache instead of
+                each instance holding its own, independently-stale copy.
+                Defaults to ``None`` (build a private ``TTLCache``, this
+                class's original behavior), so every existing
+                caller/test is unaffected.
         """
         self._analytics_repo = analytics_repo
         self._request_repo = request_repo
@@ -121,19 +147,23 @@ class AnalyticsEngine:
         self._profile_repo = profile_repo
         self._audit_repo = audit_repo
         self._notification_repo = notification_repo
+        self._response_cache = response_cache or TTLCache(ttl_seconds=cache_ttl_seconds)
         self._logger = logging.getLogger(f"{__name__}.AnalyticsEngine")
 
+    @cached_method
     def get_dashboard_metrics(
         self,
         *,
+        company_id: UUID,
         department: str | None = None,
         request_type: str | None = None,
         created_after: datetime | None = None,
         created_before: datetime | None = None,
     ) -> DashboardMetrics:
-        """Return organization-wide dashboard figures, optionally scoped.
+        """Return a company's dashboard figures, optionally further scoped.
 
         Args:
+            company_id: Restricts every figure to this company (tenant).
             department: Restrict to this department, if provided.
             request_type: Restrict to this request type, if provided.
             created_after: Restrict to requests created at or after this
@@ -152,12 +182,14 @@ class AnalyticsEngine:
         """
         self._validate_range(created_after, created_before)
         status_breakdown = self._fetch_status_breakdown(
+            company_id=company_id,
             department=department,
             request_type=request_type,
             created_after=created_after,
             created_before=created_before,
         )
         approval_metrics = self._compute_approval_metrics(
+            company_id=company_id,
             request_type=request_type,
             department=department,
             created_after=created_after,
@@ -173,17 +205,20 @@ class AnalyticsEngine:
             approval_metrics=approval_metrics,
         )
 
+    @cached_method
     def get_approval_metrics(
         self,
         *,
+        company_id: UUID,
         request_type: str | None = None,
         department: str | None = None,
         created_after: datetime | None = None,
         created_before: datetime | None = None,
     ) -> ApprovalMetrics:
-        """Return approval-related metrics, optionally scoped.
+        """Return a company's approval-related metrics, optionally further scoped.
 
         Args:
+            company_id: Restricts every figure to this company (tenant).
             request_type: Restrict to this request type, if provided.
             department: Restrict to this department, if provided.
             created_after: Restrict to decisions at or after this
@@ -205,24 +240,28 @@ class AnalyticsEngine:
         """
         self._validate_range(created_after, created_before)
         return self._compute_approval_metrics(
+            company_id=company_id,
             request_type=request_type,
             department=department,
             created_after=created_after,
             created_before=created_before,
         )
 
+    @cached_method
     def get_workflow_metrics(
         self,
         request_type: str,
         *,
+        company_id: UUID,
         department: str | None = None,
         created_after: datetime | None = None,
         created_before: datetime | None = None,
     ) -> WorkflowMetrics:
-        """Return metrics scoped to a single request type.
+        """Return a company's metrics scoped to a single request type.
 
         Args:
             request_type: The request type to scope to.
+            company_id: Restricts every figure to this company (tenant).
             department: Further restrict to this department, if
                 provided.
             created_after: Restrict to requests created at or after this
@@ -241,12 +280,14 @@ class AnalyticsEngine:
         """
         self._validate_range(created_after, created_before)
         status_breakdown = self._fetch_status_breakdown(
+            company_id=company_id,
             department=department,
             request_type=request_type,
             created_after=created_after,
             created_before=created_before,
         )
         approval_metrics = self._compute_approval_metrics(
+            company_id=company_id,
             request_type=request_type,
             department=department,
             created_after=created_after,
@@ -268,17 +309,20 @@ class AnalyticsEngine:
             throughput_per_day=throughput_per_day,
         )
 
+    @cached_method
     def get_department_metrics(
         self,
         department: str,
         *,
+        company_id: UUID,
         created_after: datetime | None = None,
         created_before: datetime | None = None,
     ) -> DepartmentMetrics:
-        """Return metrics scoped to a single department.
+        """Return a company's metrics scoped to a single department.
 
         Args:
             department: The department to scope to.
+            company_id: Restricts every figure to this company (tenant).
             created_after: Restrict to requests created at or after this
                 timestamp, if provided.
             created_before: Restrict to requests created at or before
@@ -297,9 +341,13 @@ class AnalyticsEngine:
         """
         self._validate_range(created_after, created_before)
         status_breakdown = self._fetch_status_breakdown(
-            department=department, created_after=created_after, created_before=created_before
+            company_id=company_id,
+            department=department,
+            created_after=created_after,
+            created_before=created_before,
         )
         approval_metrics = self._compute_approval_metrics(
+            company_id=company_id,
             request_type=None,
             department=department,
             created_after=created_after,
@@ -313,8 +361,9 @@ class AnalyticsEngine:
             workload=metrics.active_requests(status_breakdown.counts),
         )
 
-    def get_user_metrics(self, user_id: UUID) -> UserMetrics:
-        """Return metrics scoped to a single user.
+    @cached_method
+    def get_user_metrics(self, user_id: UUID, *, company_id: UUID) -> UserMetrics:
+        """Return metrics scoped to a single user within a company.
 
         Every figure here is computed by a single, exact, count-only
         repository call scoped to ``user_id`` — this is not a loop over
@@ -323,14 +372,22 @@ class AnalyticsEngine:
 
         Args:
             user_id: The user's id.
+            company_id: The caller's own company (tenant). If ``user_id``
+                resolves to a profile in a *different* company, this is
+                treated identically to ``user_id`` not existing at all
+                (a ``MetricCalculationError`` with the same "no profile
+                exists" message) — never distinguished, matching this
+                codebase's established not-found-vs-forbidden convention
+                for out-of-scope resources.
 
         Returns:
             The assembled ``UserMetrics``. ``average_decision_seconds``
             is always ``None`` — see that field's own docstring.
 
         Raises:
-            MetricCalculationError: If the profile does not exist, or
-                any underlying repository query fails.
+            MetricCalculationError: If the profile does not exist, does
+                not belong to ``company_id``, or any underlying
+                repository query fails.
         """
         try:
             profile = self._profile_repo.get_by_id(user_id)
@@ -338,16 +395,24 @@ class AnalyticsEngine:
             raise MetricCalculationError(f"No profile exists for user {user_id}.") from exc
         except DatabaseError as exc:
             raise MetricCalculationError(f"Failed to fetch profile {user_id}: {exc}") from exc
+        if profile.company_id != company_id:
+            raise MetricCalculationError(f"No profile exists for user {user_id}.")
 
         try:
             approved_count = self._audit_repo.list_all(
-                actor_id=user_id, action=AuditAction.STAGE_APPROVED.value, page=Page(size=1)
+                company_id=company_id,
+                actor_id=user_id,
+                action=AuditAction.STAGE_APPROVED.value,
+                page=Page(size=1),
             ).total_records
             rejected_count = self._audit_repo.list_all(
-                actor_id=user_id, action=AuditAction.STAGE_REJECTED.value, page=Page(size=1)
+                company_id=company_id,
+                actor_id=user_id,
+                action=AuditAction.STAGE_REJECTED.value,
+                page=Page(size=1),
             ).total_records
             pending_count = self._approval_repo.list_pending_for_approver(
-                assigned_to=user_id, page=Page(size=1)
+                company_id=company_id, assigned_to=user_id, page=Page(size=1)
             ).total_records
         except DatabaseError as exc:
             raise MetricCalculationError(
@@ -364,10 +429,15 @@ class AnalyticsEngine:
             average_decision_seconds=None,
         )
 
+    @cached_method
     def get_workload_summary(
-        self, *, department: str | None = None
+        self,
+        *,
+        company_id: UUID,
+        department: str | None = None,
+        pending_stages: Sequence[WorkflowStageRecord] | None = None,
     ) -> tuple[UserMetrics, ...]:
-        """Return per-user metrics for every approver/administrator in scope.
+        """Return per-user metrics for every approver/administrator in a company.
 
         Unlike a naive per-user loop, this method issues exactly three
         exhaustive fetches — every matching profile, every
@@ -376,15 +446,25 @@ class AnalyticsEngine:
         client-side by actor/assignee using ``aggregations.py``'s pure
         grouping functions. No per-user repository call is issued.
 
-        Note: the audit-entry and pending-stage fetches are
-        organization-wide (``audit_logs``/``workflow_stages`` carry no
-        department column), so the resulting per-user counts are exact
-        for each user regardless of the ``department`` filter, which is
-        applied only to the profile pool being reported on.
+        Note: the audit-entry and pending-stage fetches are company-wide
+        (``audit_logs``/``workflow_stages`` carry no department column),
+        so the resulting per-user counts are exact for each user
+        regardless of the ``department`` filter, which is applied only to
+        the profile pool being reported on.
 
         Args:
+            company_id: Restricts every figure to this company (tenant).
             department: Restrict to approvers/administrators in this
                 department, if provided.
+            pending_stages: An already-fetched, company-wide pending-stage
+                population, if the caller (typically
+                ``OperationalAnalyticsEngine``, which needs this same
+                population for its own figures) has already performed
+                this exact exhaustive fetch itself — skips this method's
+                own equivalent internal fetch, avoiding a second full
+                scan of the same rows within one request. ``None`` (the
+                default) preserves this method's original, fully
+                self-contained behavior.
 
         Returns:
             A tuple of ``UserMetrics``, one per eligible user.
@@ -396,23 +476,39 @@ class AnalyticsEngine:
                 fails.
         """
         try:
-            approvers = self._fetch_all_by_role(UserRole.APPROVER, department=department)
-            admins = self._fetch_all_by_role(UserRole.ADMIN, department=department)
+            approvers = self._fetch_all_by_role(
+                UserRole.APPROVER, company_id=company_id, department=department
+            )
+            admins = self._fetch_all_by_role(
+                UserRole.ADMIN, company_id=company_id, department=department
+            )
         except DatabaseError as exc:
-            raise MetricCalculationError(f"Failed to load workload summary profiles: {exc}") from exc
+            raise MetricCalculationError(
+                f"Failed to load workload summary profiles: {exc}"
+            ) from exc
 
         profiles = (*approvers, *admins)
 
         try:
-            approved_entries = self._fetch_all_audit(action=AuditAction.STAGE_APPROVED.value)
-            rejected_entries = self._fetch_all_audit(action=AuditAction.STAGE_REJECTED.value)
-            pending_stages = self._fetch_all_pending_stages()
+            approved_entries = self._fetch_all_audit(
+                company_id=company_id, action=AuditAction.STAGE_APPROVED.value
+            )
+            rejected_entries = self._fetch_all_audit(
+                company_id=company_id, action=AuditAction.STAGE_REJECTED.value
+            )
+            resolved_pending_stages = (
+                pending_stages
+                if pending_stages is not None
+                else self._fetch_all_pending_stages(company_id=company_id)
+            )
         except DatabaseError as exc:
-            raise MetricCalculationError(f"Failed to load workload summary activity: {exc}") from exc
+            raise MetricCalculationError(
+                f"Failed to load workload summary activity: {exc}"
+            ) from exc
 
         approved_counts = aggregations.by_actor(approved_entries)
         rejected_counts = aggregations.by_actor(rejected_entries)
-        pending_counts = aggregations.by_assignee(pending_stages)
+        pending_counts = aggregations.by_assignee(resolved_pending_stages)
 
         return tuple(
             UserMetrics(
@@ -427,22 +523,25 @@ class AnalyticsEngine:
             for profile in profiles
         )
 
+    @cached_method
     def get_request_trend(
         self,
         *,
+        company_id: UUID,
         granularity: TimeGranularity,
         department: str | None = None,
         request_type: str | None = None,
         created_after: datetime | None = None,
         created_before: datetime | None = None,
     ) -> TimeSeries:
-        """Return a time series of request submission volume, bucketed by granularity.
+        """Return a company's time series of request submission volume, bucketed by granularity.
 
         Fetches every matching request exhaustively (no page cap), since
         no repository-level "group by period" aggregate exists — the
         result reflects the complete matching population, not a sample.
 
         Args:
+            company_id: Restricts the population to this company (tenant).
             granularity: The bucket size.
             department: Restrict to this department, if provided.
             request_type: Restrict to this request type, if provided.
@@ -464,6 +563,7 @@ class AnalyticsEngine:
 
         def _fetch_page(page: Page) -> PagedResult:
             return self._request_repo.list_requests(
+                company_id=company_id,
                 department=department,
                 request_type=request_type,
                 created_after=created_after,
@@ -482,6 +582,7 @@ class AnalyticsEngine:
     def _compute_approval_metrics(
         self,
         *,
+        company_id: UUID,
         request_type: str | None,
         department: str | None,
         created_after: datetime | None,
@@ -500,6 +601,7 @@ class AnalyticsEngine:
         column); ``reminder_count`` is always ``None``.
 
         Args:
+            company_id: Restricts every figure to this company (tenant).
             request_type: The request type scope, if any.
             department: The department scope, if any.
             created_after: The lower date bound, if any.
@@ -513,6 +615,7 @@ class AnalyticsEngine:
                 fails.
         """
         status_breakdown = self._fetch_status_breakdown(
+            company_id=company_id,
             department=department,
             request_type=request_type,
             created_after=created_after,
@@ -526,18 +629,21 @@ class AnalyticsEngine:
         if department is None:
             try:
                 db_throughput = self._analytics_repo.approval_throughput(
+                    company_id=company_id,
                     request_type=request_type,
                     created_after=created_after,
                     created_before=created_before,
                 )
             except DatabaseError as exc:
-                raise MetricCalculationError(f"Failed to compute approval throughput: {exc}") from exc
+                raise MetricCalculationError(
+                    f"Failed to compute approval throughput: {exc}"
+                ) from exc
             average_decision_seconds = db_throughput.average_decision_seconds
 
         escalation_count: int | None = None
         if department is None and request_type is None:
             escalation_count = self._count_escalations(
-                created_after=created_after, created_before=created_before
+                company_id=company_id, created_after=created_after, created_before=created_before
             )
 
         throughput = ApprovalThroughput(
@@ -560,6 +666,7 @@ class AnalyticsEngine:
     def _fetch_status_breakdown(
         self,
         *,
+        company_id: UUID,
         department: str | None = None,
         request_type: str | None = None,
         created_after: datetime | None = None,
@@ -568,6 +675,7 @@ class AnalyticsEngine:
         """Fetch a request-status breakdown for an arbitrary scope.
 
         Args:
+            company_id: Restricts the population to this company (tenant).
             department: Restrict to this department, if provided.
             request_type: Restrict to this request type, if provided.
             created_after: The lower date bound, if any.
@@ -582,6 +690,7 @@ class AnalyticsEngine:
         """
         try:
             db_status = self._analytics_repo.count_requests_by_status(
+                company_id=company_id,
                 department=department,
                 request_type=request_type,
                 created_after=created_after,
@@ -592,11 +701,16 @@ class AnalyticsEngine:
         return _map_status_breakdown(db_status)
 
     def _count_escalations(
-        self, *, created_after: datetime | None, created_before: datetime | None
+        self,
+        *,
+        company_id: UUID,
+        created_after: datetime | None,
+        created_before: datetime | None,
     ) -> int:
-        """Count ``STAGE_ESCALATED`` audit events in the given date range, organization-wide.
+        """Count ``STAGE_ESCALATED`` audit events in the given date range, within a company.
 
         Args:
+            company_id: Restricts the count to this company (tenant).
             created_after: The lower bound, if provided.
             created_before: The upper bound, if provided.
 
@@ -609,6 +723,7 @@ class AnalyticsEngine:
         """
         try:
             return self._audit_repo.list_all(
+                company_id=company_id,
                 action=AuditAction.STAGE_ESCALATED.value,
                 created_after=created_after,
                 created_before=created_before,
@@ -617,7 +732,9 @@ class AnalyticsEngine:
         except DatabaseError as exc:
             raise MetricCalculationError(f"Failed to count escalations: {exc}") from exc
 
-    def _fetch_all(self, fetch_page: Callable[[Page], PagedResult], *, page_size: int = 100) -> list:
+    def _fetch_all(
+        self, fetch_page: Callable[[Page], PagedResult], *, page_size: int = 100
+    ) -> list:
         """Exhaustively fetch every page of a paginated repository query.
 
         This performs no truncation: it continues until every page
@@ -644,33 +761,39 @@ class AnalyticsEngine:
             page_number += 1
         return items
 
-    def _fetch_all_by_role(self, role: UserRole, *, department: str | None):
-        """Exhaustively fetch every profile with a given role.
+    def _fetch_all_by_role(self, role: UserRole, *, company_id: UUID, department: str | None):
+        """Exhaustively fetch every profile with a given role, within a company.
 
         Args:
             role: The role to filter by.
+            company_id: Restricts results to this company (tenant).
             department: Restrict to this department, if provided.
 
         Returns:
             The complete list of matching ``ProfileRecord`` instances.
         """
         return self._fetch_all(
-            lambda page: self._profile_repo.list_by_role(role, department=department, page=page)
+            lambda page: self._profile_repo.list_by_role(
+                role, company_id=company_id, department=department, page=page
+            )
         )
 
-    def _fetch_all_audit(self, *, action: str):
-        """Exhaustively fetch every audit entry matching an action code.
+    def _fetch_all_audit(self, *, company_id: UUID, action: str):
+        """Exhaustively fetch every audit entry matching an action code, within a company.
 
         Args:
+            company_id: Restricts results to this company (tenant).
             action: The audit action code to filter by.
 
         Returns:
             The complete list of matching ``AuditLogRecord`` instances.
         """
-        return self._fetch_all(lambda page: self._audit_repo.list_all(action=action, page=page))
+        return self._fetch_all(
+            lambda page: self._audit_repo.list_all(company_id=company_id, action=action, page=page)
+        )
 
-    def _fetch_all_pending_stages(self):
-        """Exhaustively fetch every currently pending workflow stage.
+    def _fetch_all_pending_stages(self, *, company_id: UUID):
+        """Exhaustively fetch every currently pending workflow stage, within a company.
 
         Uses ``ApprovalRepository.list_overdue_stages`` with a cutoff of
         "now," which returns every pending stage regardless of assignee
@@ -678,12 +801,17 @@ class AnalyticsEngine:
         before the current instant) — the same technique already used by
         ``app.scheduler.jobs.iter_pending_stages``.
 
+        Args:
+            company_id: Restricts results to this company (tenant).
+
         Returns:
             The complete list of matching ``WorkflowStageRecord`` instances.
         """
         cutoff = utc_now()
         return self._fetch_all(
-            lambda page: self._approval_repo.list_overdue_stages(created_before=cutoff, page=page)
+            lambda page: self._approval_repo.list_overdue_stages(
+                created_before=cutoff, company_id=company_id, page=page
+            )
         )
 
     def _period_days(
@@ -701,10 +829,7 @@ class AnalyticsEngine:
             sub-daily range) if both are provided; ``None`` if either
             bound is missing — no default period is assumed.
         """
-        if created_after is not None and created_before is not None:
-            days = seconds_between(created_after, created_before) / 86400.0
-            return days if days >= 1.0 else 1.0
-        return None
+        return metrics.period_days(created_after, created_before)
 
     def _validate_range(
         self, created_after: datetime | None, created_before: datetime | None
@@ -719,9 +844,4 @@ class AnalyticsEngine:
             InvalidTimeRangeError: If both bounds are provided and
                 ``created_after`` is later than ``created_before``.
         """
-        if (
-            created_after is not None
-            and created_before is not None
-            and created_after > created_before
-        ):
-            raise InvalidTimeRangeError(created_after, created_before)
+        validate_date_range(created_after, created_before)

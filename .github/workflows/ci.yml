@@ -1,0 +1,103 @@
+name: CI
+
+"on":
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Neither job here needs to write anything (no commits, packages, or PR
+# comments) — explicit least-privilege, matching cd.yml's own precedent,
+# rather than relying on the repository's ambient default token scope.
+permissions:
+  contents: read
+
+jobs:
+  lint-typecheck-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        # Installs from the version-pinned lockfile (generated from
+        # pyproject.toml, see requirements-dev.txt's own header comment),
+        # not `pip install -e ".[dev]"` directly against pyproject.toml's
+        # loose ranges — this is the exact, reproducible dependency set
+        # that was locked and audited, not whatever the resolver happens
+        # to pick today.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Verify lockfiles are up to date
+        # Every dependency pyproject.toml declares must still be present
+        # in requirements.txt/requirements-dev.txt, pinned to a version
+        # that satisfies pyproject's own constraint — this is what
+        # actually prevents pyproject.toml/requirements*.txt from drifting
+        # apart again (see scripts/check_lockfile_sync.py). Deliberately
+        # not a byte-for-byte diff against a freshly re-resolved
+        # pip-compile run: that would flag routine upstream patch releases
+        # as "drift" even though a lockfile pinning a point in time is
+        # exactly the intended behavior.
+        run: python scripts/check_lockfile_sync.py
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Type check (mypy)
+        run: mypy app
+
+      - name: Test (pytest)
+        # Excludes tests/integration: that suite needs a real, migrated
+        # Postgres/Supabase instance (RLS policies, the auth.users
+        # trigger) and now runs in its own dedicated job — see
+        # .github/workflows/integration.yml — against a local Supabase
+        # CLI stack, which this fast lint/typecheck job does not
+        # provision. Before this exclusion, tests/integration ran here
+        # too, but every one of its fixtures silently skipped (not
+        # failed) for lack of TEST_DATABASE_URL/TEST_SUPABASE_* — this
+        # job was reporting green without ever exercising a single
+        # integration or RLS-policy assertion.
+        run: pytest -m "not integration"
+
+  frontend-lint-typecheck-test-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint (eslint)
+        run: npm run lint
+
+      - name: Type check (tsc)
+        run: npm run typecheck
+
+      - name: Test (vitest)
+        run: npm test
+
+      - name: Build (next build)
+        # NEXT_PUBLIC_SUPABASE_URL/ANON_KEY are validated present at module
+        # load (src/lib/supabase/env.ts) but never actually contacted
+        # during a build — placeholders satisfy that check without
+        # requiring a real Supabase project's credentials in CI.
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: https://ci-placeholder.supabase.co
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ci-placeholder-anon-key
+        run: npm run build

@@ -51,7 +51,11 @@ from app.database.exceptions import (
 from app.database.exceptions import (
     RecordNotFoundError as _DbRecordNotFoundError,
 )
+from app.database.exceptions import (
+    StorageError as _DbStorageError,
+)
 from app.models.exceptions import DomainError as _ModelsDomainError
+from app.utils.exceptions import FileValidationError as _UtilsFileValidationError
 from app.workflow.exceptions import (
     AssignmentResolutionError as _EngineAssignmentResolutionError,
 )
@@ -77,10 +81,16 @@ __all__ = [
     "WorkflowError",
     "AssignmentError",
     "ConfigurationError",
+    "StorageOperationError",
+    "InvitationConflictError",
+    "SupabaseAdminOperationError",
+    "InvalidInvitationStateError",
     "translate_database_error",
     "translate_workflow_error",
     "translate_auth_error",
     "translate_model_construction_error",
+    "translate_file_validation_error",
+    "translate_storage_error",
 ]
 
 
@@ -154,6 +164,89 @@ class ConfigurationError(EAHError):
     """Raised when a dependency (most commonly the database connection)
     is unavailable or misconfigured, independent of the specific request
     being served."""
+
+
+class StorageOperationError(EAHError):
+    """Raised when a Supabase Storage operation (upload, download,
+    replace, or removal of an attachment's file content) fails.
+
+    Distinct from ``ValidationError``/``ConstraintViolationError``-derived
+    failures, which mean the *request itself* was invalid — this means
+    the underlying Storage subsystem could not complete an otherwise
+    valid request, which ``AttachmentService`` treats as retryable rather
+    than a caller mistake."""
+
+
+class InvitationConflictError(EAHError):
+    """Raised when an email-address conflict blocks an invitation
+    operation. Two call sites raise this:
+
+    - ``InvitationService.create_invitation``, when a pending invitation
+      already exists for the requested email address.
+    - ``app.services.supabase_admin_client.SupabaseAuthAdminClient``
+      implementations, when the Supabase Auth Admin API reports that a
+      user already exists for an email address — the specific,
+      catchable signal ``InvitationService.accept_invitation`` relies on
+      to recognize a retried acceptance and recover idempotently, rather
+      than treating it as a hard failure.
+
+    A precise, structured alternative to a generic ``ValidationError`` for
+    this specific, common case — mirroring ``NotFoundError``'s own reason
+    for carrying typed attributes rather than only a message string.
+
+    Attributes:
+        email: The email address the conflicting invitation or user was
+            found for.
+    """
+
+    def __init__(self, email: str) -> None:
+        super().__init__(
+            f"A conflicting record already exists for '{email}'.", details={"email": email}
+        )
+        self.email = email
+
+
+class SupabaseAdminOperationError(EAHError):
+    """Raised when a Supabase Auth Admin API operation fails for a reason
+    other than "the user already exists" (see ``InvitationConflictError``).
+
+    Distinct from ``ValidationError``/``ConstraintViolationError``-derived
+    failures, which mean the *request itself* was invalid — this means
+    the underlying Supabase Auth Admin subsystem could not complete an
+    otherwise valid request. Mirrors ``StorageOperationError``'s identical
+    rationale for the Storage integration boundary, applied here to the
+    Auth Admin integration boundary ``InvitationService.accept_invitation``
+    introduces."""
+
+
+class InvalidInvitationStateError(EAHError):
+    """Raised when an invitation state transition (resend, revoke,
+    accept) is attempted from a persisted status — or computed effective
+    state, for ``accept`` — that does not permit it.
+
+    Attributes:
+        invitation_id: The invitation's id.
+        current_status: The invitation's current persisted status value,
+            or ``"expired"`` (a computed, non-persisted value — see
+            ``app.models.enums.EffectiveInvitationStatus``) when
+            ``attempted_action`` is ``"accept"`` and the invitation is
+            pending but past its ``expires_at``.
+        attempted_action: The action that was rejected (e.g. ``"resend"``,
+            ``"revoke"``, ``"accept"``).
+    """
+
+    def __init__(self, invitation_id: Any, current_status: str, attempted_action: str) -> None:
+        super().__init__(
+            f"Cannot {attempted_action} an invitation with status '{current_status}'.",
+            details={
+                "invitation_id": str(invitation_id),
+                "current_status": current_status,
+                "attempted_action": attempted_action,
+            },
+        )
+        self.invitation_id = invitation_id
+        self.current_status = current_status
+        self.attempted_action = attempted_action
 
 
 def translate_database_error(exc: _DbError) -> EAHError:
@@ -250,3 +343,29 @@ def translate_model_construction_error(
             f"'{model_name}' failed validation.", details={"errors": exc.errors()}
         )
     return ValidationError(f"'{model_name}' failed validation: {exc.message}")
+
+
+def translate_file_validation_error(exc: _UtilsFileValidationError) -> ValidationError:
+    """Translate an ``app.utils.file_utils`` validation failure into a ``ValidationError``.
+
+    Args:
+        exc: The exception raised by a ``file_utils`` validation function
+            (filename sanitization, content-type allow-list, size limit,
+            or declared-vs-sniffed content-type consistency).
+
+    Returns:
+        A ``ValidationError`` describing the failure.
+    """
+    return ValidationError(exc.message)
+
+
+def translate_storage_error(exc: _DbStorageError) -> StorageOperationError:
+    """Translate an ``app.database.exceptions.StorageError`` into a ``StorageOperationError``.
+
+    Args:
+        exc: The exception raised by ``AttachmentStorageGateway``.
+
+    Returns:
+        A ``StorageOperationError`` describing the failure.
+    """
+    return StorageOperationError(exc.message, details=exc.details)

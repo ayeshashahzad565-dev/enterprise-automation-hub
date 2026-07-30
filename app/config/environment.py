@@ -12,14 +12,14 @@ independently and early, before the rest of configuration is loaded).
 
 from __future__ import annotations
 
-from enum import Enum
-from typing import Mapping
+from collections.abc import Mapping
+from enum import StrEnum
 
 from app.config.constants import ENV_APP_ENVIRONMENT
 from app.config.exceptions import EnvironmentDetectionError
 
 
-class Environment(str, Enum):
+class Environment(StrEnum):
     """The four environments EAH is deployed into, per DG Section 3.
 
     Values are lowercase strings so that ``Environment(raw_value)``

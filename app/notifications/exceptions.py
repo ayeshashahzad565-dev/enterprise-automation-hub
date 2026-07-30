@@ -2,9 +2,10 @@
 
 Mirroring the pattern already established in every finalized package,
 every exception this package can raise is defined here, exactly once.
-Each branch corresponds to one of this package's four responsibilities:
-template rendering, email delivery, in-app persistence, and
-configuration.
+``EmailDeliveryError`` and ``NotificationConfigurationError`` are the two
+failure modes ``app.notifications.email_sender.SmtpEmailProvider`` itself
+raises; ``NotificationError`` is also registered directly as a defensive
+FastAPI exception handler (``app.api.exception_handlers``).
 """
 
 from __future__ import annotations
@@ -30,27 +31,6 @@ class NotificationError(Exception):
         return f"{self.__class__.__name__}(message={self.message!r}, details={self.details!r})"
 
 
-class TemplateRenderingError(NotificationError):
-    """Raised when a notification template cannot be rendered.
-
-    Attributes:
-        event: The notification event the template was selected for, as
-            a plain string (avoids a hard import dependency on
-            ``NotificationEvent`` at the exception level).
-        missing_field: The name of the placeholder that could not be
-            resolved from the supplied context, if that was the cause.
-    """
-
-    def __init__(self, event: str, *, missing_field: str | None = None, reason: str | None = None) -> None:
-        if missing_field is not None:
-            message = f"Cannot render template for event '{event}': missing placeholder '{missing_field}'."
-        else:
-            message = f"Cannot render template for event '{event}': {reason or 'unknown error'}."
-        super().__init__(message, details={"event": event, "missing_field": missing_field})
-        self.event = event
-        self.missing_field = missing_field
-
-
 class EmailDeliveryError(NotificationError):
     """Raised when an email could not be delivered after all configured
     retry attempts were exhausted, or a non-retryable SMTP failure
@@ -66,12 +46,6 @@ class EmailDeliveryError(NotificationError):
             details={"to_address": to_address},
         )
         self.to_address = to_address
-
-
-class NotificationPersistenceError(NotificationError):
-    """Raised when a notification record cannot be created through the
-    Repository Layer.
-    """
 
 
 class NotificationConfigurationError(NotificationError):

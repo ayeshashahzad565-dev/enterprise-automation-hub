@@ -12,24 +12,38 @@ fixed scheduling technology named in the ADD and Deployment Guide — but
 it is not the only implementation ``SchedulerCoordinator`` could be
 given; substituting a different backend requires only a new class
 satisfying ``SchedulerBackend``.
+
+Per ``docs/scheduler_distributed_coordination.md``, ``SchedulerCoordinator``
+additionally accepts an optional ``leader_check`` and
+``distributed_lock_factory`` (``app.scheduler.distributed_lock``) so a
+multi-instance deployment can be made safe: a tick is skipped outright if
+this instance is not the elected leader, and — even if it is — skipped
+again if another instance already holds that specific job's distributed
+execution lock (defense-in-depth against a split-brain window). Both
+parameters default to this package's original single-instance behavior,
+so every existing caller is unaffected.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Callable
 from datetime import datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
+from app.scheduler.distributed_lock import DistributedLock, NullDistributedLock
 from app.scheduler.exceptions import (
     JobAlreadyRunningError,
+    JobLockedElsewhereError,
+    NotLeaderError,
     SchedulerShutdownError,
     SchedulerStartupError,
 )
 from app.scheduler.interfaces import ExecutionContext, JobStatistics
-from app.scheduler.registry import JobRegistry
+from app.scheduler.registry import JobRegistration, JobRegistry
 from app.utils.datetime_utils import utc_now
 from app.utils.id_generator import generate_uuid_str
 
@@ -87,7 +101,9 @@ class APSchedulerBackend:
         """
         try:
             self._scheduler.remove_job(job_id)
-        except Exception:  # noqa: BLE001 - APScheduler raises JobLookupError; absence is not an error here
+        except (
+            Exception
+        ):  # noqa: BLE001 - APScheduler raises JobLookupError; absence is not an error here
             logger.debug("No scheduled job '%s' to remove.", job_id, extra={"job_name": job_id})
 
     def get_next_run_time(self, job_id: str) -> datetime | None:
@@ -136,18 +152,48 @@ class SchedulerCoordinator:
     testable with fake implementations of either (TSD Section 3.1).
     """
 
-    def __init__(self, *, backend, registry: JobRegistry) -> None:
+    def __init__(
+        self,
+        *,
+        backend,
+        registry: JobRegistry,
+        leader_check: Callable[[], bool] | None = None,
+        distributed_lock_factory: Callable[[str], DistributedLock] | None = None,
+    ) -> None:
         """Initialize the coordinator with its injected collaborators.
 
         Args:
             backend: Any object satisfying the ``SchedulerBackend``
                 protocol.
             registry: The job registry to schedule jobs from.
+            leader_check: A zero-argument callable returning whether this
+                instance currently holds Scheduler leadership — in
+                production, ``app.scheduler.leader_election.LeaderElection.
+                is_leader``'s bound getter, when Redis-backed election is
+                active. ``None`` (the default) means every tick is always
+                treated as leader — this package's original,
+                single-instance behavior, and what every existing caller
+                and test of this class already relies on.
+            distributed_lock_factory: A callable building a fresh
+                ``DistributedLock`` for a given job name, called once per
+                job at ``register_job`` time. ``None`` (the default)
+                means every job's distributed lock is a
+                ``NullDistributedLock`` — always "acquired," never
+                actually contended — preserving this package's original
+                behavior (only the in-process ``threading.Lock`` below
+                matters) when Redis is not configured.
         """
         self._backend = backend
         self._registry = registry
+        self._leader_check = leader_check
+        self._distributed_lock_factory: Callable[[str], DistributedLock] = (
+            distributed_lock_factory
+            if distributed_lock_factory is not None
+            else lambda _job_name: NullDistributedLock()
+        )
         self._stats: dict[str, JobStatistics] = {}
         self._locks: dict[str, threading.Lock] = {}
+        self._distributed_locks: dict[str, DistributedLock] = {}
         self._stats_lock = threading.RLock()
         self._logger = logging.getLogger(f"{__name__}.SchedulerCoordinator")
 
@@ -179,6 +225,7 @@ class SchedulerCoordinator:
         with self._stats_lock:
             self._stats[job.name] = JobStatistics(job_name=job.name)
             self._locks[job.name] = threading.Lock()
+            self._distributed_locks[job.name] = self._distributed_lock_factory(job.name)
 
         if self.is_running and enabled:
             registration = self._registry.get_registration(job.name)
@@ -231,6 +278,74 @@ class SchedulerCoordinator:
 
         self._logger.info("Scheduler stopped (graceful=%s).", wait)
 
+    def get_registration(self, job_name: str) -> JobRegistration:
+        """Return a registered job's interval/enabled-state registration.
+
+        Used alongside ``get_statistics`` by the admin job-management API
+        to present a scheduled job's full picture (configuration +
+        live execution statistics) without that caller needing its own
+        reference to this coordinator's ``JobRegistry``.
+
+        Args:
+            job_name: The job's name.
+
+        Raises:
+            JobRegistrationError: If no job with this name is registered.
+        """
+        return self._registry.get_registration(job_name)
+
+    def enable_job(self, job_name: str) -> None:
+        """Enable a registered job, so it resumes running on its interval.
+
+        Args:
+            job_name: The job's name.
+
+        Raises:
+            JobRegistrationError: If no job with this name is registered.
+        """
+        self._registry.enable(job_name)
+
+    def disable_job(self, job_name: str) -> None:
+        """Disable a registered job, so it stops running on its interval
+        (it remains registered and can still be triggered on demand via
+        ``trigger_now``).
+
+        Args:
+            job_name: The job's name.
+
+        Raises:
+            JobRegistrationError: If no job with this name is registered.
+        """
+        self._registry.disable(job_name)
+
+    def trigger_now(self, job_name: str) -> None:
+        """Execute a registered job immediately, out of band from its normal interval.
+
+        Used by the admin job-management API
+        (``POST /admin/scheduled-jobs/{job_name}/trigger-now``) to let an
+        operator run a job on demand without waiting for its next tick.
+        Reuses the exact runner ``_make_runner`` builds for an ordinary
+        scheduled tick — including its per-job lock — so a manual trigger
+        can never execute concurrently with a naturally-scheduled tick of
+        the same job, and the triggered run's outcome is recorded through
+        the same statistics ``get_statistics``/``get_all_statistics``
+        already expose. Runs on a short-lived daemon thread so this
+        method itself returns immediately, without waiting for the job to
+        finish; if the job's lock is already held (a tick is already in
+        progress), the triggered run is skipped exactly like an
+        overlapping scheduled tick would be (recorded as a
+        ``skipped_overlap_count`` increment, not an error).
+
+        Args:
+            job_name: The job's name.
+
+        Raises:
+            JobRegistrationError: If no job with this name is registered.
+        """
+        self._registry.get(job_name)  # raises JobRegistrationError if unregistered
+        runner = self._make_runner(job_name)
+        threading.Thread(target=runner, name=f"trigger-now-{job_name}", daemon=True).start()
+
     def get_statistics(self, job_name: str) -> JobStatistics | None:
         """Return the current statistics for a single job.
 
@@ -279,6 +394,8 @@ class SchedulerCoordinator:
             success_count=stats.success_count,
             failure_count=stats.failure_count,
             skipped_overlap_count=stats.skipped_overlap_count,
+            skipped_not_leader_count=stats.skipped_not_leader_count,
+            skipped_distributed_lock_count=stats.skipped_distributed_lock_count,
             currently_running=stats.currently_running,
             last_started_at=stats.last_started_at,
             last_finished_at=stats.last_finished_at,
@@ -301,6 +418,17 @@ class SchedulerCoordinator:
         """
 
         def _run() -> None:
+            if self._leader_check is not None and not self._leader_check():
+                try:
+                    raise NotLeaderError(job_name)
+                except NotLeaderError as exc:
+                    self._logger.debug(str(exc), extra={"job_name": job_name})
+                    with self._stats_lock:
+                        stats = self._stats.get(job_name)
+                        if stats is not None:
+                            stats.skipped_not_leader_count += 1
+                    return
+
             lock = self._locks.get(job_name)
             if lock is None:
                 self._logger.warning(
@@ -323,42 +451,66 @@ class SchedulerCoordinator:
                     return
 
             try:
-                with self._stats_lock:
-                    stats = self._stats[job_name]
-                    stats.currently_running = True
+                # Acquired after the in-process lock, released before it —
+                # the in-process lock is the cheaper, always-available
+                # check (no Redis round trip), so it is tried first; the
+                # distributed lock is this instance's only defense against
+                # *another instance* running the same job concurrently
+                # (whether because it is also the elected leader during a
+                # brief split-brain window, or because leader election is
+                # not configured at all — see ``__init__``'s docstring).
+                distributed_lock = self._distributed_locks.get(job_name)
+                if distributed_lock is not None and not distributed_lock.acquire(blocking=False):
+                    try:
+                        raise JobLockedElsewhereError(job_name)
+                    except JobLockedElsewhereError as exc:
+                        self._logger.warning(str(exc), extra={"job_name": job_name})
+                        with self._stats_lock:
+                            stats = self._stats.get(job_name)
+                            if stats is not None:
+                                stats.skipped_distributed_lock_count += 1
+                        return
 
                 try:
-                    job = self._registry.get(job_name)
-                except Exception:  # noqa: BLE001 - job was unregistered between tick and invocation
-                    self._logger.warning(
-                        "Job '%s' fired but is no longer registered; skipping.",
-                        job_name,
-                        extra={"job_name": job_name},
+                    with self._stats_lock:
+                        stats = self._stats[job_name]
+                        stats.currently_running = True
+
+                    try:
+                        job = self._registry.get(job_name)
+                    except Exception:  # noqa: BLE001 - job was unregistered between tick and invocation
+                        self._logger.warning(
+                            "Job '%s' fired but is no longer registered; skipping.",
+                            job_name,
+                            extra={"job_name": job_name},
+                        )
+                        return
+
+                    context = ExecutionContext(
+                        job_name=job_name, scheduled_time=utc_now(), run_id=generate_uuid_str()
                     )
-                    return
+                    result = job.run(context)
 
-                context = ExecutionContext(
-                    job_name=job_name, scheduled_time=utc_now(), run_id=generate_uuid_str()
-                )
-                result = job.run(context)
-
-                with self._stats_lock:
-                    stats = self._stats[job_name]
-                    stats.run_count += 1
-                    if result.success:
-                        stats.success_count += 1
-                        stats.last_error = None
-                    else:
-                        stats.failure_count += 1
-                        stats.last_error = result.error_message
-                    stats.last_started_at = result.started_at
-                    stats.last_finished_at = result.finished_at
-                    stats.last_duration_seconds = result.duration_seconds
+                    with self._stats_lock:
+                        stats = self._stats[job_name]
+                        stats.run_count += 1
+                        if result.success:
+                            stats.success_count += 1
+                            stats.last_error = None
+                        else:
+                            stats.failure_count += 1
+                            stats.last_error = result.error_message
+                        stats.last_started_at = result.started_at
+                        stats.last_finished_at = result.finished_at
+                        stats.last_duration_seconds = result.duration_seconds
+                finally:
+                    with self._stats_lock:
+                        stats = self._stats.get(job_name)
+                        if stats is not None:
+                            stats.currently_running = False
+                    if distributed_lock is not None:
+                        distributed_lock.release()
             finally:
-                with self._stats_lock:
-                    stats = self._stats.get(job_name)
-                    if stats is not None:
-                        stats.currently_running = False
                 lock.release()
 
         return _run

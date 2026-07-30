@@ -6,6 +6,20 @@
 **Author:** Principal Software Architect
 **Stack:** Python 3.11, Streamlit, Supabase (PostgreSQL, Auth, Storage), Pydantic v2, APScheduler, Plotly, pytest
 
+> **Superseded note:** This document describes EAH's original pre-implementation
+> baseline design — a single Streamlit process (`src/ui`, `src/services`,
+> `src/repositories`, Plotly charts). That Presentation Layer has since been
+> **fully removed** and replaced with a FastAPI REST API (`app/`) behind a
+> separate Next.js 15 / React 19 frontend (`frontend/`), plus a Redis-backed
+> production infrastructure layer (rate limiting, caching, a background job
+> queue) — none of which existed when this document was written. The
+> layering *philosophy* below (Presentation → Application → Domain →
+> Repository → Database, dependency injection, RLS defense-in-depth,
+> configuration-driven workflows) still holds; every mention of Streamlit,
+> Plotly, or a `src/` path is historical and does not describe the shipped
+> system. For the current architecture, see `PROJECT_SUMMARY.md`,
+> `docs/deployment.md`, and `docs/ai_integration.md`.
+
 ---
 
 ## 1. Executive Overview

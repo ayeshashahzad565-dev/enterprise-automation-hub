@@ -1,0 +1,94 @@
+name: Integration
+
+# Runs tests/integration (repository CRUD, schema/constraint, optimistic
+# locking, and Row-Level Security policy enforcement) against a real,
+# ephemeral local Supabase stack — the same local Supabase CLI
+# infrastructure e2e.yml already uses, and for the same reason: this
+# project's auth.users/profiles trigger (migration 0002) and RLS
+# policies (migrations 0003, 0011, 0014, 0016, 0019) require Supabase
+# Auth's real `auth` schema, not a vanilla `postgres:16` service
+# container. No hosted project, no secrets.
+#
+# Separate from ci.yml: this job provisions Postgres/Auth and migrates
+# before it can run a single test, which would otherwise slow down
+# ci.yml's fast lint/typecheck/unit-test feedback loop. ci.yml itself
+# excludes tests/integration (`-m "not integration"`) precisely so that
+# ownership of this suite lives only here.
+
+"on":
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# This job only reads the repo — explicit least-privilege, matching
+# cd.yml's own precedent.
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    env:
+      APP_ENVIRONMENT: testing
+      CI: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Start local Supabase stack
+        run: supabase start --ignore-health-check
+
+      - name: Export local Supabase connection details
+        # `supabase status -o env` prints the same fixed local dev keys
+        # every `supabase start` produces — never a secret, only ever
+        # valid against this ephemeral, job-local instance. These map to
+        # this suite's TEST_* variables (see tests/integration/README.md),
+        # deliberately distinct names from the app's own DATABASE_URL/
+        # SUPABASE_* so this suite can never be pointed at a real project
+        # just because a populated .env happens to be present.
+        run: |
+          eval "$(supabase status -o env | sed 's/^/export /')"
+          {
+            echo "DATABASE_URL=$DB_URL"
+            echo "TEST_DATABASE_URL=$DB_URL"
+            echo "TEST_SUPABASE_URL=$API_URL"
+            echo "TEST_SUPABASE_ANON_KEY=$ANON_KEY"
+            echo "TEST_SUPABASE_SERVICE_ROLE_KEY=$SERVICE_ROLE_KEY"
+          } >> "$GITHUB_ENV"
+
+      - name: Apply migrations
+        # This is what actually provisions RLS: migrations 0003, 0011,
+        # 0014, 0016, and 0019 are the ones that `enable row level
+        # security` and create every policy this suite exercises.
+        run: alembic upgrade head
+
+      - name: Run integration suite
+        # No -m filter needed: testpaths is repo-wide, but pointing
+        # pytest at this directory alone means only tests/integration's
+        # own pytestmark (pytest.mark.integration) is ever selected here.
+        # Every fixture in tests/integration/conftest.py now fails the
+        # job outright (rather than skipping) if any TEST_* variable it
+        # needs is unset while CI=true — see conftest.py's
+        # `_running_in_ci`/`_missing_config` — so a broken step above
+        # (a typo'd env var name, a Supabase start failure that still
+        # exits 0) cannot silently report this job as green.
+        run: pytest tests/integration -v
+
+      - name: Stop local Supabase stack
+        if: always()
+        run: supabase stop

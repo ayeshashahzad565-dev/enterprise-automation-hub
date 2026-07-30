@@ -17,7 +17,7 @@ contract layer independent of its physical transport.
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 from app.utils.datetime_utils import format_iso8601, utc_now
@@ -33,7 +33,7 @@ __all__ = [
 ]
 
 
-class ErrorCode(str, Enum):
+class ErrorCode(StrEnum):
     """The closed catalog of application error codes, matching API-ADD
     Section 11.3 exactly.
 

@@ -1,0 +1,224 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  /* Was `var(--font-sans)` — a self-referential value that never resolves,
+     so every element fell back to the browser's UA-default serif stack
+     instead of the Geist font actually loaded in layout.tsx. */
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --font-heading: var(--font-sans);
+
+  /* Type scale — named tiers so headings/metrics/captions are expressed
+     once as tokens (text-display/-title/-heading/-body/-caption) rather
+     than every component re-deriving its own text-size + line-height +
+     tracking combination. See components/patterns/typography.tsx, the
+     only place these are meant to be consumed directly.
+     display = page title (48px/700), title = section title / metric
+     (28px/600), heading = card title (18px/600). Body/small/caption are
+     handled below by overriding Tailwind's own text-sm/text-xs, since
+     those two utilities (not a bespoke token) are what the rest of the
+     app already uses for every paragraph, label, and meta line. */
+  --text-display: 3rem;
+  --text-display--line-height: 3.5rem;
+  --text-display--letter-spacing: -0.02em;
+  --text-title: 1.75rem;
+  --text-title--line-height: 2.25rem;
+  --text-title--letter-spacing: -0.01em;
+  --text-heading: 1.125rem;
+  --text-heading--line-height: 1.75rem;
+  --text-body: 0.9375rem;
+  --text-body--line-height: 1.625rem;
+  --text-caption: 0.75rem;
+  --text-caption--line-height: 1rem;
+
+  /* Body (15px) and small text (13px) — overriding Tailwind's built-in
+     text-sm/text-xs so the hundreds of existing call sites that already
+     use them (paragraphs, labels, table cells, meta text) pick up the new
+     sizes and taller line-heights without a file-by-file rewrite. True
+     12px fine print stays on --text-caption above (Caption/Mono only). */
+  --text-sm: 0.9375rem;
+  --text-sm--line-height: 1.5rem;
+  --text-xs: 0.8125rem;
+  --text-xs--line-height: 1.125rem;
+
+  /* Overlay transition durations — one shared scale so Dialog/Sheet/
+     Popover/Tooltip animate at the same two speeds instead of each
+     hardcoding its own number (previously 100/150/200ms independently). */
+  --duration-fast: 150ms;
+  --duration-base: 200ms;
+
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-status-pending: var(--status-pending-bg);
+  --color-status-pending-foreground: var(--status-pending-fg);
+  --color-status-in-review: var(--status-in-review-bg);
+  --color-status-in-review-foreground: var(--status-in-review-fg);
+  --color-status-completed: var(--status-completed-bg);
+  --color-status-completed-foreground: var(--status-completed-fg);
+  --color-status-rejected: var(--status-rejected-bg);
+  --color-status-rejected-foreground: var(--status-rejected-fg);
+  --color-status-withdrawn: var(--status-withdrawn-bg);
+  --color-status-withdrawn-foreground: var(--status-withdrawn-fg);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  /* Brand accent — an indigo-blue, the same hue family as the
+     previously-defined but unused dark-mode --sidebar-primary
+     (oklch(0.488 0.243 264.376)). Promoted into the app's one real accent
+     color: primary actions, focus rings, links, active nav state, and
+     the first chart series all derive from this hue. */
+  --primary: oklch(0.53 0.211 264);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.53 0.211 264);
+  /* Categorical chart palette, extended from the brand accent — replaces
+     the previous achromatic 5-step gray ramp so multi-series charts
+     (Department Compare, trend breakdowns) have real hue separation. */
+  --chart-1: oklch(0.53 0.211 264);
+  --chart-2: oklch(0.62 0.13 195);
+  --chart-3: oklch(0.76 0.15 80);
+  --chart-4: oklch(0.62 0.19 20);
+  --chart-5: oklch(0.56 0.19 300);
+  --radius: 0.625rem;
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: oklch(0.53 0.211 264);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.97 0 0);
+  --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: oklch(0.922 0 0);
+  --sidebar-ring: oklch(0.53 0.211 264);
+
+  /* Status colors — the one semantic palette this design system adds on
+     top of Phase 1's chrome tokens. Each pairs a light tinted background
+     with a darker, saturated foreground of the same hue (the same
+     "100/800"-style pairing Tailwind's own palette uses for accessible
+     badges), meeting WCAG AA (4.5:1) against its own background. Consumed
+     only by components/patterns/status-badge.tsx. */
+  --status-pending-bg: oklch(0.96 0.06 95);
+  --status-pending-fg: oklch(0.43 0.13 60);
+  --status-in-review-bg: oklch(0.94 0.03 255);
+  --status-in-review-fg: oklch(0.4 0.15 260);
+  --status-completed-bg: oklch(0.95 0.05 145);
+  --status-completed-fg: oklch(0.4 0.12 150);
+  --status-rejected-bg: oklch(0.95 0.04 25);
+  --status-rejected-fg: oklch(0.45 0.18 25);
+  --status-withdrawn-bg: oklch(0.95 0 0);
+  --status-withdrawn-fg: oklch(0.45 0 0);
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.68 0.19 264);
+  --primary-foreground: oklch(0.145 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.68 0.19 264);
+  --chart-1: oklch(0.68 0.19 264);
+  --chart-2: oklch(0.72 0.11 195);
+  --chart-3: oklch(0.8 0.14 80);
+  --chart-4: oklch(0.7 0.17 20);
+  --chart-5: oklch(0.7 0.17 300);
+  --sidebar: oklch(0.205 0 0);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.68 0.19 264);
+  --sidebar-primary-foreground: oklch(0.145 0 0);
+  --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.68 0.19 264);
+
+  --status-pending-bg: oklch(0.28 0.05 70);
+  --status-pending-fg: oklch(0.88 0.12 85);
+  --status-in-review-bg: oklch(0.28 0.06 260);
+  --status-in-review-fg: oklch(0.85 0.1 250);
+  --status-completed-bg: oklch(0.27 0.06 150);
+  --status-completed-fg: oklch(0.85 0.13 150);
+  --status-rejected-bg: oklch(0.28 0.07 25);
+  --status-rejected-fg: oklch(0.85 0.12 20);
+  --status-withdrawn-bg: oklch(0.3 0 0);
+  --status-withdrawn-fg: oklch(0.8 0 0);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
+  }
+}
+
+/* The login left-panel's workflow visualization (features/auth/components/
+   workflow-network.tsx) is a Canvas-driven simulation, not CSS keyframes —
+   it handles prefers-reduced-motion itself (a single static frame, no
+   rAF loop) rather than needing an animation class disabled here. */

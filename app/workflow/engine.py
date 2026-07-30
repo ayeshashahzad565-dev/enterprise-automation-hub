@@ -20,8 +20,8 @@ client, or any mock beyond plain Python values (TSD Section 3.2).
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Sequence
 from uuid import UUID
 
 from app.models import Profile, StageDefinition, WorkflowDefinition, WorkflowDefinitionDocument

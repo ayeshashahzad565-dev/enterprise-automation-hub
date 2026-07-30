@@ -89,8 +89,7 @@ class RetryExhaustedError(UtilityError):
 
     def __init__(self, attempts: int, last_exception: BaseException) -> None:
         message = (
-            f"Operation failed after {attempts} attempt(s); "
-            f"last error: {last_exception!r}"
+            f"Operation failed after {attempts} attempt(s); " f"last error: {last_exception!r}"
         )
         super().__init__(message)
         self.attempts = attempts

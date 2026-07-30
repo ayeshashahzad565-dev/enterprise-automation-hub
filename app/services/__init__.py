@@ -35,6 +35,7 @@ from __future__ import annotations
 
 from app.services.analytics_service import AnalyticsService
 from app.services.approval_service import ApprovalService, map_workflow_stage_record_to_domain
+from app.services.comment_service import CommentService, map_comment_record_to_domain
 from app.services.dashboard_service import DashboardService, DashboardSummary
 from app.services.exceptions import (
     AssignmentError,
@@ -56,7 +57,11 @@ from app.services.notification_service import (
     map_notification_record_to_domain,
 )
 from app.services.request_service import (
+    AuditEntryDetail,
     RequestService,
+    UpcomingStage,
+    WorkflowProgress,
+    WorkflowStageDetail,
     map_profile_record_to_domain,
     map_request_record_to_domain,
 )
@@ -72,6 +77,9 @@ __all__ = [
     # approval_service
     "ApprovalService",
     "map_workflow_stage_record_to_domain",
+    # comment_service
+    "CommentService",
+    "map_comment_record_to_domain",
     # dashboard_service
     "DashboardService",
     "DashboardSummary",
@@ -93,7 +101,11 @@ __all__ = [
     "NotificationService",
     "map_notification_record_to_domain",
     # request_service
+    "AuditEntryDetail",
     "RequestService",
+    "UpcomingStage",
+    "WorkflowProgress",
+    "WorkflowStageDetail",
     "map_profile_record_to_domain",
     "map_request_record_to_domain",
     # workflow_definition_service

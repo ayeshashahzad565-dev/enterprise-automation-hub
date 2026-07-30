@@ -1,0 +1,13 @@
+# Auto-provisions every dashboard JSON in /etc/grafana/dashboards (mounted
+# from deploy/grafana/dashboards) on Grafana container startup.
+apiVersion: 1
+
+providers:
+  - name: "EAH"
+    orgId: 1
+    folder: "Enterprise Automation Hub"
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/dashboards

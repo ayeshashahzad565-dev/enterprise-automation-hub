@@ -1,0 +1,167 @@
+name: Security
+
+"on":
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * 1"
+
+# Every job here only scans/reports (pip-audit, npm audit, gitleaks,
+# bandit, Trivy) — none writes commits, packages, or PR comments.
+# Explicit least-privilege, matching cd.yml's own precedent.
+permissions:
+  contents: read
+
+jobs:
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        # Installs the version-pinned production lockfile — the exact
+        # dependency set the Docker image ships, not whatever `pip install
+        # -e .` freshly resolves from pyproject.toml's loose ranges. The
+        # audit below is only meaningful if it scans what's really shipped.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Audit dependencies for known vulnerabilities
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt
+
+  frontend-dependency-audit:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Fail build on critical-severity vulnerabilities
+        # Unlike the high-severity check below, this one is blocking (no
+        # continue-on-error) — a `critical` finding must fail the build.
+        # Passes clean today (0 critical among the 12 high/2 moderate
+        # findings described below).
+        run: npm audit --audit-level=critical
+
+      - name: Audit dependencies for known vulnerabilities (high, informational)
+        # continue-on-error: as of this workflow's introduction, `npm
+        # audit` reports advisories against `next`/`postcss`/`sharp`
+        # whose only available non-breaking resolution is `npm audit fix
+        # --force`, which npm's own resolver reports would *downgrade*
+        # the direct `next` dependency to a 2019-era 9.x release —
+        # clearly wrong for an app on Next.js 15, not a real fix. These
+        # are tracked as a disclosed, known gap (not silently ignored)
+        # rather than force-applying a change that would break the
+        # application; revisit once upstream advisories/fixed versions
+        # catch up. The step still runs and reports on every build so a
+        # newly introduced, unrelated vulnerability is still visible.
+        run: npm audit --audit-level=high
+        continue-on-error: true
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan for committed secrets (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  sast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Static analysis (bandit)
+        run: |
+          pip install bandit
+          # Medium+ severity, medium+ confidence — a real Low-confidence
+          # or Low-severity finding (e.g. B101 assert_used, used
+          # throughout this codebase for internal invariant narrowing,
+          # never as a security control) would otherwise dominate the
+          # report without indicating an actual vulnerability.
+          bandit -r app -ll -ii
+
+  container-scan:
+    # Scans the built backend/frontend images for OS and library
+    # vulnerabilities (Trivy). Builds locally via `load: true` rather than
+    # reusing cd.yml's push job, so this runs on every PR (before an image
+    # is ever published) rather than only after a merge to `main`.
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - image: backend
+            context: .
+            file: ./Dockerfile
+            build_args: ""
+          - image: frontend
+            context: ./frontend
+            file: ./frontend/Dockerfile
+            # Same CI-placeholder values as ci.yml's frontend build step —
+            # satisfy src/lib/supabase/env.ts's module-load-time validation
+            # only, never contacted during the build.
+            build_args: |
+              NEXT_PUBLIC_SUPABASE_URL=https://ci-placeholder.supabase.co
+              NEXT_PUBLIC_SUPABASE_ANON_KEY=ci-placeholder-anon-key
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build ${{ matrix.image }} image for scanning
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          push: false
+          load: true
+          tags: eah-${{ matrix.image }}:scan
+          build-args: ${{ matrix.build_args }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Fail build on critical-severity image vulnerabilities
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: eah-${{ matrix.image }}:scan
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Report high-severity image vulnerabilities (informational)
+        # Mirrors the blocking/non-blocking split already used for
+        # bandit (-ll) and the npm critical/high audit steps above —
+        # visible on every build, does not block on findings with no
+        # available fix yet.
+        if: always()
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: eah-${{ matrix.image }}:scan
+          severity: HIGH
+          exit-code: "0"
+          ignore-unfixed: true

@@ -107,6 +107,32 @@ class DatabaseClient(Protocol):
         """
         ...
 
+    def rpc(self, fn: str, params: dict[str, Any]) -> Any:
+        """Return a query builder invoking the given Postgres function.
+
+        Used for server-side aggregation (``GROUP BY``/``COUNT``/``AVG``)
+        that would otherwise require transferring every matching row to
+        compute in Python — see ``AnalyticsRepository``, whose aggregate
+        methods call functions defined in
+        ``app/database/migrations/versions/0022_analytics_aggregation_functions.py``.
+        The returned object exposes the same terminal ``.execute()`` call
+        as ``table(...)``, per PostgREST's own RPC endpoint contract.
+        """
+        ...
+
+    @property
+    def storage(self) -> Any:
+        """Return the underlying Supabase Storage client.
+
+        The returned object is expected to expose the standard
+        ``storage3`` bucket interface (``.from_(bucket_id)`` returning an
+        object with ``upload``/``download``/``remove``/
+        ``create_signed_url``, etc.), as provided by the underlying
+        ``supabase-py`` client. Used exclusively by
+        ``app.database.attachment_storage.AttachmentStorageGateway``.
+        """
+        ...
+
     def health_check(self) -> bool:
         """Return ``True`` if this client can successfully reach the
         configured Supabase project, ``False`` otherwise.
@@ -159,13 +185,25 @@ class SupabaseDatabaseClient:
         """
         return self._client.table(name)
 
+    def rpc(self, fn: str, params: dict[str, Any]) -> Any:
+        """Return a PostgREST query builder invoking the Postgres function ``fn``.
+
+        Args:
+            fn: The function's name, unqualified (``public`` is PostgREST's
+                configured schema for every project this codebase targets).
+            params: Keyword arguments to pass, matching the function's own
+                parameter names exactly.
+        """
+        return self._client.rpc(fn, params)
+
     @property
     def storage(self) -> Any:
         """Expose the underlying Supabase Storage client.
 
-        Used only by attachment-handling code (outside this package's
-        current scope) that needs to read or write objects per DSD
-        Section 7 and API-ADD Section 23's file-handling discipline.
+        Used exclusively by
+        ``app.database.attachment_storage.AttachmentStorageGateway``,
+        which reads and writes attachment file content per DSD Section 7
+        and API-ADD Section 23's file-handling discipline.
         """
         return self._client.storage
 
@@ -244,6 +282,53 @@ class SupabaseClientFactory:
         return SupabaseDatabaseClient(raw_client, is_service_role=False)
 
     @staticmethod
+    def create_user_scoped_client(
+        settings: SupabaseConnectionSettings, access_token: str
+    ) -> SupabaseDatabaseClient:
+        """Construct a client that runs every query as a specific, already-
+        authenticated caller, so Row-Level Security (DSD Section 9) is
+        actually enforced rather than bypassed.
+
+        This is Supabase's own documented pattern for a server-side caller
+        that wants to preserve RLS instead of using the service-role key:
+        build an ordinary anon-key client, then attach the caller's own
+        verified access token to the underlying PostgREST client
+        (``client.postgrest.auth(access_token)``), which makes every
+        subsequent request use that token's ``Authorization`` header —
+        Postgres then evaluates policies with ``auth.uid()`` resolving to
+        this caller, not the anon role. A fresh client is constructed on
+        every call rather than mutating a shared instance, since the
+        underlying ``postgrest.auth(...)`` call mutates the client's
+        headers in place — reusing one instance across concurrent callers
+        with different tokens would let one request's identity leak into
+        another's.
+
+        Args:
+            settings: The target Supabase project's connection settings.
+            access_token: The caller's own verified Supabase access token
+                (the same bearer token already validated by
+                ``SupabaseTokenVerifier.resolve_claims`` for this request).
+
+        Returns:
+            A ``SupabaseDatabaseClient`` with ``is_service_role`` set to
+            ``False``, scoped to exactly this caller's RLS context.
+
+        Raises:
+            DatabaseConnectionError: If the underlying client cannot be
+                constructed.
+        """
+        try:
+            raw_client = create_client(settings.url, settings.anon_key)
+            raw_client.postgrest.auth(access_token)
+        except Exception as exc:  # noqa: BLE001 - translated into a typed error below
+            logger.error("Failed to construct Supabase user-scoped client: %s", exc, exc_info=exc)
+            raise DatabaseConnectionError(
+                "Failed to construct a Supabase client scoped to the caller's own token.",
+                details={"url": settings.url},
+            ) from exc
+        return SupabaseDatabaseClient(raw_client, is_service_role=False)
+
+    @staticmethod
     def create_service_role_client(settings: SupabaseConnectionSettings) -> SupabaseDatabaseClient:
         """Construct a client authenticated with the elevated service-role key.
 
@@ -278,9 +363,7 @@ class SupabaseClientFactory:
         try:
             raw_client = create_client(settings.url, settings.service_role_key)
         except Exception as exc:  # noqa: BLE001 - translated into a typed error below
-            logger.error(
-                "Failed to construct Supabase service-role client: %s", exc, exc_info=exc
-            )
+            logger.error("Failed to construct Supabase service-role client: %s", exc, exc_info=exc)
             raise DatabaseConnectionError(
                 "Failed to construct a Supabase client using the service-role key.",
                 details={"url": settings.url},

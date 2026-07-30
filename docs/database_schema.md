@@ -6,6 +6,19 @@
 **Author:** Principal Database Architect
 **Platform:** Supabase (PostgreSQL, Auth, Storage)
 
+> **Superseded note:** The schema below is unaffected by the later
+> Presentation Layer rewrite (Streamlit → FastAPI + Next.js) and remains
+> an accurate description of the live database. Two details in Section
+> 9.3 below are now stale: the application-process description ("the
+> Python process running Streamlit and APScheduler" now applies to the
+> FastAPI process, `app/`, still running APScheduler in-process — see
+> `docs/deployment.md` for the current process topology), and the claim
+> that the service-role key is used "exclusively" server-side — a
+> verified subset of repositories now instead run under a per-request,
+> caller-scoped client so RLS is actually enforced for them. See
+> `docs/tenant_isolation.md` for exactly which, why, and how the rest are
+> hardened differently.
+
 ---
 
 ## 1. Database Overview
@@ -136,12 +149,15 @@ comments   (1) ──── (0..M) comments          [parent_comment_id — self
 | `version` | `integer` | No | `1` | Row version used for optimistic concurrency control (see Section 3.9) |
 | `created_at` | `timestamptz` | No | `now()` | Record creation timestamp |
 | `updated_at` | `timestamptz` | No | `now()` | Last modification timestamp |
+| `is_active` | `boolean` | No | `true` | Whether this profile may currently authenticate (`0020_profile_lifecycle`) — reversible deactivation, checked on every request |
+| `deleted_at` | `timestamptz` | Yes | `NULL` | When this profile was erased (GDPR right-to-erasure), if ever — see Section 3.10 |
+| `deleted_by` | `uuid` | Yes | `NULL` | The admin who performed the erasure, if any |
 
 - **Primary Key:** `id`
-- **Foreign Keys:** `id` references `auth.users.id`
+- **Foreign Keys:** `id` references `auth.users.id`; `deleted_by` references `profiles.id` (self-referencing, `ON DELETE SET NULL`)
 - **Unique Constraints:** `id` (implicit via primary key / 1:1 relationship)
-- **Indexes:** index on `role`; index on `department`
-- **Business Rules:** A `profiles` row is created automatically the first time a user authenticates (via a Supabase trigger on `auth.users`, described only at the architectural level here, not as SQL). `role` may only be changed by an `admin`. Updates to `role` or `department` are performed under optimistic locking, per Section 3.9.
+- **Indexes:** index on `role`; index on `department`; index on `deleted_at` (backs the `deleted_at IS NULL` default filter every listing method applies)
+- **Business Rules:** A `profiles` row is created automatically the first time a user authenticates (via a Supabase trigger on `auth.users`, described only at the architectural level here, not as SQL). `role` may only be changed by an `admin`. Updates to `role`, `department`, or `is_active` are performed under optimistic locking, per Section 3.9. Erasure (`deleted_at`/`deleted_by`) is irreversible and additionally overwrites `full_name`/`department` — see Section 3.10.
 
 ### 3.2 `workflow_definitions`
 
@@ -280,12 +296,13 @@ comments   (1) ──── (0..M) comments          [parent_comment_id — self
 | `read_at` | `timestamptz` | Yes | `NULL` | Timestamp the notification was marked read |
 | `email_sent` | `boolean` | No | `false` | Whether the corresponding email was successfully dispatched |
 | `email_sent_at` | `timestamptz` | Yes | `NULL` | Timestamp of successful email dispatch |
+| `archived_at` | `timestamptz` | Yes | `NULL` | Timestamp the recipient archived this notification, removing it from their default view (added by this application's notification-management UX build-out — see Section 8.5) |
 | `created_at` | `timestamptz` | No | `now()` | Notification creation timestamp |
 
 - **Primary Key:** `id`
 - **Foreign Keys:** `recipient_id` references `profiles.id`; `request_id` references `requests.id`
 - **Unique Constraints:** none
-- **Indexes:** index on `recipient_id`; index on `is_read`; index on `request_id`; index on `created_at`
+- **Indexes:** index on `recipient_id`; index on `is_read`; index on `request_id`; index on `created_at`; composite index on (`recipient_id`, `archived_at`)
 - **Business Rules:** `email_sent` failing to become `true` never blocks or reverses the creation of the in-app row — the two effects are independent, consistent with the ADD's description of the Notification Service.
 
 ### 3.8 `audit_logs`
@@ -331,29 +348,57 @@ Certain business entities support **soft deletion** rather than physical row rem
 - **Support for "undo" and administrative review.** A request withdrawn in error, or a comment removed by an administrator, can be reasoned about and, if the business process allows it, restored, because the data was never actually destroyed.
 - **Consistency with the immutability principle already established for `audit_logs`.** Soft deletion is the natural extension of that same philosophy — "never destroy history" — applied to the handful of business tables where a user-facing notion of "removal" is still required.
 
-Soft deletion is **not** applied uniformly across the schema. `workflow_stages`, `notifications`, `workflow_definitions`, and `audit_logs` are not soft-deletable: stages and definitions are never removed once created (only deactivated or superseded, per their own business rules), notifications are transient enough that their lifecycle is fully described by `is_read`, and `audit_logs` rows are never deleted in any form, soft or hard, per Section 6. Every repository method that lists rows from a soft-deletable table filters on `deleted_at IS NULL` by default, so soft-deleted rows are excluded from ordinary application views without requiring every call site to remember to add the filter explicitly.
+Soft deletion is **not** applied uniformly across the schema. `workflow_stages`, `notifications`, `workflow_definitions`, and `audit_logs` are not soft-deletable: stages and definitions are never removed once created (only deactivated or superseded, per their own business rules), and `audit_logs` rows are never deleted in any form, soft or hard, per Section 6. Every repository method that lists rows from a soft-deletable table filters on `deleted_at IS NULL` by default, so soft-deleted rows are excluded from ordinary application views without requiring every call site to remember to add the filter explicitly.
+
+**`profiles`** (`0020_profile_lifecycle`) has a two-tier lifecycle distinct from the pattern above, mirroring `companies`' own `is_active`/`deleted_at` split:
+
+- `is_active` (reversible deactivation): blocks login immediately (`SupabaseTokenVerifier` checks it on every request), touches no other column, and is fully reversible.
+- `deleted_at`/`deleted_by` (GDPR right-to-erasure): **irreversible**, because the same operation also overwrites `full_name`/`department` with an anonymized placeholder (`ProfileRepository.erase`) — unlike `requests`/`comments`/`attachments`/`companies`, there is no `restore` for an erased profile, since the original PII is gone. This is deliberately not physical deletion: `audit_logs.actor_id` and `requests.requester_id` are `ON DELETE RESTRICT` against `profiles.id` (Section 4), making a genuine `DELETE` of any profile with real history impossible by design — anonymization is the only path for a user who has ever done anything, which is exactly what GDPR Article 17(3) permits (retaining data in a form that no longer identifies the subject, where full erasure would conflict with legitimate audit/record-keeping needs). The corresponding Supabase Auth user's email (the one piece of PII this table doesn't hold) is scrubbed separately, via the Supabase Auth Admin API (`app.services.supabase_admin_client.SupabaseAuthAdminClient.anonymize_user`), never by deleting the `auth.users` row (see Section 4's note on `profiles.id → auth.users.id`).
+
+`notifications` is a related but distinct case: its lifecycle is described by `is_read` plus, as of this application's notification-management UX build-out, `archived_at` (Section 8.5) — a lightweight, fully reversible "put away" timestamp, not full soft-deletion. The distinction matters: a soft-deleted row is hidden from every ordinary view by default and generally not meant to come back; an archived notification is hidden only from the recipient's own default view, remains trivially queryable (`is_archived=True`), and is restored with a single `unarchive` call. It therefore does not need `deleted_by` (no accountability question — a recipient can only archive their own notification), nor does soft-deletion's `RESTRICT`-preserving rationale apply (nothing else references a notification by foreign key).
 
 ---
 
 ## 4. Relationship Rules
 
+Every foreign key referencing `profiles` was audited as part of the
+user-deletion/GDPR-erasure feature (`0020_profile_lifecycle`) and given
+one of three deliberate policies — see that migration's own docstring for
+the full reasoning. In short: `RESTRICT` for core audit/business records
+that must never be silently orphaned (and which, together, make a
+genuine hard `DELETE` of any profile with real history impossible —
+anonymization, Section 3.10, is the only path for such a user);
+`CASCADE` for purely personal, ephemeral data; `SET NULL` for secondary
+"who did this" attribution columns, where losing the specific link is an
+acceptable trade-off.
+
 | Relationship | Cascade / Restrict Behavior | Rationale |
 |---|---|---|
-| `profiles.id` → `auth.users.id` | `ON DELETE CASCADE` | If a user's identity is removed from Supabase Auth, the corresponding profile is removed with it, since a profile has no meaning without an identity. |
-| `requests.requester_id` → `profiles.id` | `ON DELETE RESTRICT` | A profile cannot be deleted while it has authored requests; historical requests must always resolve to a requester. Deactivation, not deletion, is the intended path for offboarding a user (via `profiles.role` or a future `is_active` flag). |
+| `profiles.id` → `auth.users.id` | `ON DELETE CASCADE` | If a user's identity is removed from Supabase Auth, the corresponding profile is removed with it. In practice this cascade cannot succeed for a profile with real history, since `audit_logs.actor_id`/`requests.requester_id` below are `RESTRICT` — which is why GDPR erasure anonymizes rather than deletes (Section 3.10). |
+| `profiles.deleted_by` → `profiles.id` | `ON DELETE SET NULL` | If the admin who erased a profile is later erased themselves, the erased profile's own row is untouched — only the "who did this" attribution is lost. |
+| `requests.requester_id` → `profiles.id` | `ON DELETE RESTRICT` | A profile cannot be deleted while it has authored requests; historical requests must always resolve to a requester. Deactivation or GDPR erasure (anonymization, never deletion), not physical deletion, is the path for offboarding a user (`profiles.is_active` / `deleted_at`). |
+| `requests.deleted_by` → `profiles.id` | `ON DELETE SET NULL` | "Who soft-deleted this request" is secondary metadata; losing it is acceptable, blocking the deleter's own erasure is not. |
 | `requests.workflow_definition_id` → `workflow_definitions.id` | `ON DELETE RESTRICT` | A workflow definition referenced by any existing request can never be deleted, only deactivated (`is_active = false`), preserving the historical approval chain of past requests. |
 | `requests.current_stage_id` → `workflow_stages.id` | `ON DELETE SET NULL`, deferrable within the creation transaction | This is a forward reference used to answer "what stage is this request waiting on" without a join; it is nulled out automatically if the referenced stage row is ever removed, though in practice stage rows are never deleted (see below). |
 | `workflow_stages.request_id` → `requests.id` | `ON DELETE CASCADE` | A stage has no independent existence outside its parent request; if a request is ever purged (an administrative action outside normal application flow), its stages are purged with it. |
-| `workflow_stages.assigned_to` / `decided_by` → `profiles.id` | `ON DELETE RESTRICT` | Historical stage records must always resolve to the user who was assigned or who decided; as above, user removal is handled by deactivation. |
+| `workflow_stages.assigned_to` / `decided_by` → `profiles.id` | `ON DELETE SET NULL` | The stage's own `status`/`decided_at` remain the record of what happened; for any real decision, a corresponding `audit_logs` row (itself `RESTRICT`-protected) is the authoritative record of who acted, so losing this link on a later profile erasure doesn't lose the decision's history. |
+| `workflow_definitions.created_by` → `profiles.id` | `ON DELETE SET NULL` | A workflow template outlives its author; not core audit trail. |
 | `comments.request_id` → `requests.id` | `ON DELETE CASCADE` | Comments have no meaning independent of their request. |
 | `comments.author_id` → `profiles.id` | `ON DELETE RESTRICT` | Preserves attribution of historical comments. |
+| `comments.deleted_by` → `profiles.id` | `ON DELETE SET NULL` | Same reasoning as `requests.deleted_by`. |
 | `comments.parent_comment_id` → `comments.id` | `ON DELETE CASCADE` | If a parent comment is removed (an administrative action, not a normal user action), its replies are removed with it to avoid orphaned thread fragments. |
 | `attachments.request_id` → `requests.id` | `ON DELETE CASCADE` | Attachment metadata has no meaning independent of its request; the corresponding Storage object is removed by the Application layer as a coordinated step, not by a database-level trigger, consistent with the ADD's rule that repositories — not the database — own Storage interaction. |
 | `attachments.uploaded_by` → `profiles.id` | `ON DELETE RESTRICT` | Preserves attribution of historical uploads. |
+| `attachments.deleted_by` → `profiles.id` | `ON DELETE SET NULL` | Same reasoning as `requests.deleted_by`. |
 | `notifications.recipient_id` → `profiles.id` | `ON DELETE CASCADE` | A notification has no purpose once its recipient no longer exists. |
 | `notifications.request_id` → `requests.id` | `ON DELETE CASCADE` | Notifications tied to a purged request are purged with it. |
-| `audit_logs.actor_id` → `profiles.id` | `ON DELETE RESTRICT` | Audit history must remain resolvable to the acting user; this is the strongest guarantee in the schema, matching the immutability principle in Section 6. |
+| `notification_preferences.user_id` / `saved_filters.user_id` / `search_history.user_id` → `profiles.id` | `ON DELETE CASCADE` | Purely personal, per-user settings/history with no value once their owner is gone. |
+| `audit_logs.actor_id` → `profiles.id` | `ON DELETE RESTRICT` | Audit history must remain resolvable to the acting user; this is the strongest guarantee in the schema, matching the immutability principle in Section 6, and the mechanism that makes anonymization (not deletion) the only possible erasure path for any profile with audit history. |
 | `audit_logs.request_id` → `requests.id` | `ON DELETE RESTRICT` | Audit entries must never be silently removed as a side effect of removing their subject request; a request is not deleted while audit history referencing it exists. |
+| `user_invitations.invited_by` → `profiles.id` | `ON DELETE SET NULL` | An admin who invited many users and later left the company shouldn't block their own erasure; the invitation record itself remains meaningful without this link. |
+| `user_invitations.accepted_profile_id` → `profiles.id` | `ON DELETE SET NULL` | Same reasoning. |
+| `jobs.actor_id` → `profiles.id` | `ON DELETE SET NULL` | Secondary "who triggered this job" metadata; `audit_logs` is the authoritative record where one exists. |
+| `companies.deleted_by` / `company_licenses.updated_by` / `feature_flags.updated_by` → `profiles.id` | `ON DELETE SET NULL` | Same "secondary attribution" reasoning as the `deleted_by` columns above. |
 
 In practice, `requests` rows are never hard-deleted by any application code path; the `RESTRICT` behaviors above exist as a database-level safeguard against accidental deletion attempted outside the normal application flow, not as a behavior the application is expected to trigger.
 
@@ -498,6 +543,10 @@ The `notification_type` column constrains every row to one of a fixed set of cat
 
 Per the ADD, every notification is also dispatched as an email as part of the baseline. `email_sent` and `email_sent_at` record the outcome of that dispatch independently of the row's existence — a failed email send does not remove or invalidate the in-app notification, and a retry mechanism (implemented at the Application layer, not the database layer) may update `email_sent` from `false` to `true` after a successful later attempt.
 
+### 8.5 Archive Status
+
+`archived_at` (nullable timestamp) lets a recipient remove a notification from their default, active view without deleting it or losing its `is_read`/`read_at` history. `NotificationRepository.list_for_recipient`'s `is_archived` parameter defaults to `False` (the active view, `archived_at IS NULL`); a caller may instead request `True` (only archived notifications) or `None` (both). Archiving is fully reversible via a single `unarchive` call, and an archived notification never contributes to `get_unread_count` — archiving is how a recipient signals a notification no longer needs their attention, independent of whether they had already read it. See Section 3.10 for how this differs from this schema's soft-deletion strategy.
+
 ---
 
 ## 9. Row Level Security
@@ -551,6 +600,12 @@ Supabase issues two distinct kinds of API keys: an **anon** key, used by client-
 
 **Why client operations remain protected by RLS.** Anything reachable from the browser — any Streamlit session acting on a user's behalf — connects using the anon key and is therefore always subject to the RLS policies in Section 9.2, regardless of what the Presentation layer's own code does or fails to check. This is the same defense-in-depth principle described in the ADD's Security Architecture: application-level authorization checks and database-level RLS are two independent layers, and a bug in one does not remove the protection of the other. The service-role key's elevated access is deliberately confined to trusted, server-side code paths that have already passed through the Application layer's own authorization logic — it is never a substitute for RLS on the client-facing surface, only a necessary capability for the small set of legitimately cross-cutting backend operations described above.
 
+### 9.4 `companies` Table and `FORCE ROW LEVEL SECURITY`
+
+`companies` (added by the multi-tenancy conversion, migrations `0009`-`0011`) carries RLS too: an authenticated user may `SELECT` only their own company's row (`id = current_profile_company()`); no `INSERT`/`UPDATE`/`DELETE` grant is given to `authenticated` at all, since company creation and management is exclusively a service-role, platform-admin-gated operation (`CompanyService`) — client code never modifies this table directly.
+
+Every table in this section additionally has `FORCE ROW LEVEL SECURITY` set (migration `0014`). This has no effect on the service-role client — its `BYPASSRLS` role attribute always wins regardless of `FORCE` — but closes a narrower, latent gap: a connection authenticated as a table's owner (a direct `psql` session, a migration role, or an admin tool) bypasses RLS by default even without `BYPASSRLS`, unless `FORCE` is set.
+
 ---
 
 ## 10. Database Indexing Strategy
@@ -595,8 +650,28 @@ The single-column indexes above are sufficient for filtering on one predicate at
 | `requests` | (`status`, `created_at`) | "All requests in a given status, ordered by age" — used by dashboard and escalation-adjacent views that need the oldest pending requests first. |
 | `workflow_stages` | (`assigned_to`, `status`) | "My pending approvals" — the approver's default view, filtering a specific user's assigned stages down to `status = 'pending'`. |
 | `notifications` | (`recipient_id`, `is_read`) | "My unread notifications" — the single most frequent notification query, run on every page load to populate a notification badge. |
+| `notifications` | (`recipient_id`, `archived_at`) | "My active notifications" (the default Notification Center view) and "my archived notifications," both filtered on this pair. |
+| `requests` | (`company_id`, `status`) | The Analytics Layer's `count_requests_by_status` — every dashboard/workflow/department metric's status breakdown, always filtered to the caller's own company, and (since migration `0022`) grouped by this same pair inside Postgres itself. |
+| `requests` | (`company_id`, `created_at` desc) | The Analytics Layer's date-range aggregates (`count_requests_by_type`, `count_requests_by_department`, `approval_throughput`, `get_request_trend`), all scoped to one company and ordered/filtered by submission date. |
+| `requests` | (`company_id`, `request_type`) | The Analytics Layer's `count_requests_by_type` — `request_type` is this query's `group by` column, not just an optional filter, once it runs as a real SQL aggregate (migration `0021`). |
+| `requests` | (`company_id`, `department`) | The Analytics Layer's `count_requests_by_department` — same reasoning, for `department` as the `group by` column (migration `0021`). |
+| `workflow_stages` | (`company_id`, `status`) | The approver's pending-approvals queue (`list_pending_for_approver`) and the Analytics Layer's company-scoped workload summary (`list_overdue_stages` called with an explicit `company_id`), both requiring a same-company, same-status match — the multi-tenancy conversion's `company_id` column on this table exists specifically because no `request_id` is in hand to scope through otherwise. |
+| `audit_logs` | (`company_id`, `created_at` desc) | The organization-wide "Recent Activity" feed and admin dashboard's recent-activity panel (`AuditRepository.list_all`, always company-scoped), and the Analytics Layer's escalation count — all read newest-first within one company. |
+| `audit_logs` | (`company_id`, `action`, `created_at` desc) | `OperationalAnalyticsEngine`'s approval/rejection-trend bucketing and workload-summary activity counts, which filter `list_all` on `action` in addition to `company_id` (migration `0013`). |
+| `profiles` | (`company_id`, `role`, `department`) | `ProfileRepository.list_by_role` — the `department_queue` assignment strategy's eligible-approver resolution and the admin user directory, both filtering role and (optionally) department within one company (migration `0023`). |
+| `requests` | (`company_id`, `requester_id`) | An `employee`-role caller's "my requests" view (`RequestService.list_requests`) — the single most frequently issued list query in the application (migration `0024`). |
+| `audit_logs` | (`company_id`, `actor_id`, `created_at` desc) | `GET /api/v1/activity`, the caller's own activity feed — issued by every authenticated user, newest first (migration `0024`). |
+| `user_invitations` | (`company_id`, `status`, `expires_at`) | `InvitationRepository.list_invitations`'s admin invitation-management view, replacing a pre-multi-tenancy `(status, expires_at)` index that had no `company_id` leading column (migration `0024`). |
 
-These composite indexes do not replace the single-column indexes in Section 10.1: some queries (e.g., "all requests in a department," or "all audit entries for an actor") still filter on only one of these columns, and the single-column indexes remain the more efficient path for those cases. The two sets of indexes are complementary, chosen to match the two distinct shapes of query the application actually issues.
+These composite indexes do not replace the single-column indexes in Section 10.1: some queries (e.g., "all requests in a department," or `AuditRepository.list_for_actor`'s "all audit entries by one actor, regardless of company") still filter on only one of these columns, and the single-column indexes remain the more efficient path for those cases. The two sets of indexes are complementary, chosen to match the two distinct shapes of query the application actually issues.
+
+Deliberately not added: a `workflow_definitions (company_id, request_type)` composite for the general definition-listing/search path. That table holds a handful of rows per company (one row per request-type version, not one per business transaction), the access pattern is a rare admin operation, and its highest-value case — finding *the* active definition for a type — is already served by the existing partial unique index, `workflow_definitions_active_uidx (company_id, request_type) where is_active`. Adding a further index here would be speculative rather than justified by query frequency or table growth, unlike every index in the table above.
+
+Every `AnalyticsRepository` aggregate (`count_requests_by_status`/`_by_type`/`_by_department`/`approval_throughput`) is computed inside Postgres via a `group by`/`count`/`avg`, not by fetching every matching row and grouping in Python — see `app/database/migrations/versions/0022_analytics_aggregation_functions.py`. Each function returns only the aggregated rows (at most one per status/type/department, or a single row for throughput), rather than one row per matching request or workflow stage.
+
+### 10.3 Substring Search Is Deliberately Unindexed
+
+The global-search feature's per-entity substring queries (`comments.body`, `audit_logs.action`, `profiles.full_name`, `workflow_definitions.request_type`, alongside the pre-existing `requests.title`/`requests.description`) all use a plain, unindexed `ILIKE '%term%'` predicate. A leading `%` wildcard cannot use a standard B-tree index regardless of whether one exists, so no index is added for these columns purely to support search — doing so would be a genuine no-op, not a missed optimization. Real index-accelerated substring/typo-tolerant search would require PostgreSQL's `pg_trgm` extension and a GIN trigram index per searched column, which this schema does not provision (see the Global Search endpoint's own "Matching" note, API-ADD Section 19.11.1, for the resulting, deliberate scope this implies). At this application's documented scale (SRS Section 12.1), a sequential scan per search term is the accepted trade-off; `pg_trgm` is the natural first upgrade if search volume or table size ever makes that unacceptable.
 
 ---
 

@@ -15,7 +15,7 @@ transformation of its input.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 __all__ = [
     "utc_now",
@@ -40,7 +40,7 @@ def utc_now() -> datetime:
     Returns:
         The current UTC datetime, with ``tzinfo`` set.
     """
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def ensure_timezone_aware(value: datetime) -> datetime:
@@ -58,7 +58,7 @@ def ensure_timezone_aware(value: datetime) -> datetime:
         A timezone-aware datetime, equal to ``value`` if it was already
         aware, or ``value`` with UTC attached if it was naive.
     """
-    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 def to_utc(value: datetime) -> datetime:
@@ -70,7 +70,7 @@ def to_utc(value: datetime) -> datetime:
     Returns:
         The equivalent datetime with ``tzinfo`` set to UTC.
     """
-    return ensure_timezone_aware(value).astimezone(timezone.utc)
+    return ensure_timezone_aware(value).astimezone(UTC)
 
 
 def format_iso8601(value: datetime) -> str:

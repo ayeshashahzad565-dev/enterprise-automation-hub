@@ -41,11 +41,24 @@ class Profile(IdentifiedModel, UpdatableTimestampModel, VersionedModel):
             whitespace stripping.
         role: The user's RBAC role (API-ADD Section 6.1).
         department: The user's organizational department, if set.
+        company_id: The company (tenant) this profile belongs to. Every
+            profile belongs to exactly one company; there is no
+            cross-company membership.
+        is_platform_admin: Whether this profile carries platform-level
+            administrative capability, orthogonal to ``role`` — grants
+            access only to the small set of platform-only
+            company-management endpoints (create/list/deactivate a
+            company; invite a company's first user), never to ordinary
+            company-scoped business permissions. Not a ``UserRole`` tier,
+            specifically so it can never accidentally satisfy an existing
+            ``role is UserRole.ADMIN`` check.
     """
 
     full_name: str = Field(min_length=1)
     role: UserRole
     department: str | None = None
+    company_id: UUID
+    is_platform_admin: bool = False
 
 
 class ProfileCreate(EAHBaseModel):
@@ -63,12 +76,18 @@ class ProfileCreate(EAHBaseModel):
         role: The initial RBAC role. Defaults to ``UserRole.EMPLOYEE``,
             matching the column's database default (DSD Section 3.1).
         department: The initial department, if known.
+        company_id: The company (tenant) this profile belongs to.
+        is_platform_admin: Whether this profile carries platform-level
+            administrative capability. Defaults to ``False``, matching
+            the column's database default.
     """
 
     id: UUID
     full_name: str = Field(min_length=1)
     role: UserRole = UserRole.EMPLOYEE
     department: str | None = None
+    company_id: UUID
+    is_platform_admin: bool = False
 
 
 class ProfileUpdate(PartialUpdateModel):
@@ -93,14 +112,12 @@ class ProfileUpdate(PartialUpdateModel):
     department: str | None = None
 
     @model_validator(mode="after")
-    def _require_at_least_one_field(self) -> "ProfileUpdate":
+    def _require_at_least_one_field(self) -> ProfileUpdate:
         """Reject a patch payload that sets no field at all.
 
         Raises:
             EmptyUpdatePayloadError: If no field was explicitly provided.
         """
         if not self.has_updates():
-            raise EmptyUpdatePayloadError(
-                "ProfileUpdate requires at least one field to update."
-            )
+            raise EmptyUpdatePayloadError("ProfileUpdate requires at least one field to update.")
         return self

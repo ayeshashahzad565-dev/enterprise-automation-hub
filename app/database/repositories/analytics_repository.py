@@ -12,12 +12,20 @@ data store.
 
 Every method in this class is read-only. None of them insert, update, or
 delete a row.
+
+Every aggregate below is computed inside Postgres (``group by``/``count``/
+``avg``, via a function called through PostgREST's RPC endpoint —
+``self._client.rpc(...)``), not by fetching every matching row and
+grouping in Python. The functions themselves live in
+``app/database/migrations/versions/0022_analytics_aggregation_functions.py``,
+whose docstring explains why: each of these queries used to transfer one
+row per matching request (or per matching workflow stage) to produce, at
+most, a handful of grouped counts.
 """
 
 from __future__ import annotations
 
 import logging
-from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -26,9 +34,20 @@ from uuid import UUID
 from app.database.client import DatabaseClient
 from app.database.repositories.base_repository import BaseRepository
 from app.database.repositories.request_repository import RequestStatus
-from app.database.repositories.workflow_repository import StageStatus
 
 logger = logging.getLogger(__name__)
+
+
+def _iso(value: datetime | None) -> str | None:
+    """Render an optional timestamp as an ISO-8601 string, or ``None``.
+
+    RPC parameters are sent as JSON, unlike ``.gte()``/``.lte()`` on a
+    table query builder (which accept ``.isoformat()`` directly too) —
+    kept as a tiny shared helper purely so every method below passes
+    timestamps the same way, not because the two are ever actually
+    different in shape.
+    """
+    return value.isoformat() if value is not None else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,29 +108,34 @@ class ApprovalThroughput:
 class AnalyticsRepository(BaseRepository[dict[str, Any]]):
     """Read-only aggregation queries supporting analytics dashboards.
 
-    This repository's ``table_name`` is set to ``"requests"`` because that
-    is the table most of its methods query directly; methods that need
-    ``workflow_stages`` instead query it explicitly via ``self._client``
-    rather than through ``self._query()``, which is scoped to
-    ``table_name``.
+    This repository's ``table_name`` is set to ``"requests"`` — the table
+    most of these aggregates are over — purely so ``BaseRepository``'s own
+    error messages can name it; every method here calls a Postgres
+    function via ``self._client.rpc(...)`` directly rather than
+    ``self._query()``, which is scoped to a single table and cannot
+    express a ``group by`` or a cross-table join in one round trip.
     """
 
     table_name = "requests"
 
-    def __init__(self, client: DatabaseClient) -> None:
-        super().__init__(client)
+    def __init__(self, client: DatabaseClient, *, always_use_injected_client: bool) -> None:
+        super().__init__(client, always_use_injected_client=always_use_injected_client)
 
     def count_requests_by_status(
         self,
         *,
+        company_id: UUID,
         department: str | None = None,
         request_type: str | None = None,
         created_after: datetime | None = None,
         created_before: datetime | None = None,
     ) -> StatusBreakdown:
-        """Count requests grouped by lifecycle status.
+        """Count requests grouped by lifecycle status, within a company.
 
         Args:
+            company_id: Restricts results to this company (tenant) —
+                required, never optional, so a caller can never
+                accidentally issue an unscoped, cross-tenant aggregate.
             department: Restrict to this department, if provided.
             request_type: Restrict to this request type, if provided.
             created_after: Restrict to requests created at or after this
@@ -122,30 +146,36 @@ class AnalyticsRepository(BaseRepository[dict[str, Any]]):
         Returns:
             A ``StatusBreakdown`` summarizing the matching population.
         """
-        builder = self._query().select("status").is_("deleted_at", "null")
-        builder = self._apply_common_filters(
-            builder,
-            department=department,
-            request_type=request_type,
-            created_after=created_after,
-            created_before=created_before,
+        response = self._execute(
+            self._client.rpc(
+                "analytics_count_requests_by_status",
+                {
+                    "p_company_id": str(company_id),
+                    "p_department": department,
+                    "p_request_type": request_type,
+                    "p_created_after": _iso(created_after),
+                    "p_created_before": _iso(created_before),
+                },
+            ),
+            operation="count_requests_by_status",
         )
-        response = self._execute(builder, operation="count_requests_by_status")
         rows = self._rows(response)
-        tally: Counter[str] = Counter(row["status"] for row in rows)
-        counts = {RequestStatus(status): count for status, count in tally.items()}
+        counts = {RequestStatus(row["status"]): row["request_count"] for row in rows}
         return StatusBreakdown(counts=counts, total=sum(counts.values()))
 
     def count_requests_by_type(
         self,
         *,
+        company_id: UUID,
         department: str | None = None,
         created_after: datetime | None = None,
         created_before: datetime | None = None,
     ) -> VolumeByKey:
-        """Count requests grouped by request type.
+        """Count requests grouped by request type, within a company.
 
         Args:
+            company_id: Restricts results to this company (tenant) —
+                required, never optional.
             department: Restrict to this department, if provided.
             created_after: Restrict to requests created at or after this
                 timestamp, if provided.
@@ -155,32 +185,38 @@ class AnalyticsRepository(BaseRepository[dict[str, Any]]):
         Returns:
             A ``VolumeByKey`` summarizing request volume per type.
         """
-        builder = self._query().select("request_type").is_("deleted_at", "null")
-        builder = self._apply_common_filters(
-            builder,
-            department=department,
-            request_type=None,
-            created_after=created_after,
-            created_before=created_before,
+        response = self._execute(
+            self._client.rpc(
+                "analytics_count_requests_by_type",
+                {
+                    "p_company_id": str(company_id),
+                    "p_department": department,
+                    "p_created_after": _iso(created_after),
+                    "p_created_before": _iso(created_before),
+                },
+            ),
+            operation="count_requests_by_type",
         )
-        response = self._execute(builder, operation="count_requests_by_type")
         rows = self._rows(response)
-        tally: Counter[str] = Counter(row["request_type"] for row in rows)
-        return VolumeByKey(counts=dict(tally), total=sum(tally.values()))
+        counts = {row["request_type"]: row["request_count"] for row in rows}
+        return VolumeByKey(counts=counts, total=sum(counts.values()))
 
     def count_requests_by_department(
         self,
         *,
+        company_id: UUID,
         request_type: str | None = None,
         created_after: datetime | None = None,
         created_before: datetime | None = None,
     ) -> VolumeByKey:
-        """Count requests grouped by department.
+        """Count requests grouped by department, within a company.
 
         Requests with no department set are grouped under the key
         ``"unspecified"``.
 
         Args:
+            company_id: Restricts results to this company (tenant) —
+                required, never optional.
             request_type: Restrict to this request type, if provided.
             created_after: Restrict to requests created at or after this
                 timestamp, if provided.
@@ -190,27 +226,31 @@ class AnalyticsRepository(BaseRepository[dict[str, Any]]):
         Returns:
             A ``VolumeByKey`` summarizing request volume per department.
         """
-        builder = self._query().select("department").is_("deleted_at", "null")
-        builder = self._apply_common_filters(
-            builder,
-            department=None,
-            request_type=request_type,
-            created_after=created_after,
-            created_before=created_before,
+        response = self._execute(
+            self._client.rpc(
+                "analytics_count_requests_by_department",
+                {
+                    "p_company_id": str(company_id),
+                    "p_request_type": request_type,
+                    "p_created_after": _iso(created_after),
+                    "p_created_before": _iso(created_before),
+                },
+            ),
+            operation="count_requests_by_department",
         )
-        response = self._execute(builder, operation="count_requests_by_department")
         rows = self._rows(response)
-        tally: Counter[str] = Counter(row.get("department") or "unspecified" for row in rows)
-        return VolumeByKey(counts=dict(tally), total=sum(tally.values()))
+        counts = {row["department"]: row["request_count"] for row in rows}
+        return VolumeByKey(counts=counts, total=sum(counts.values()))
 
     def approval_throughput(
         self,
         *,
+        company_id: UUID,
         request_type: str | None = None,
         created_after: datetime | None = None,
         created_before: datetime | None = None,
     ) -> ApprovalThroughput:
-        """Compute average decision latency and completion rate.
+        """Compute average decision latency and completion rate, within a company.
 
         Average decision latency is computed from ``workflow_stages``
         rows with a terminal status (``approved`` or ``rejected``),
@@ -218,6 +258,8 @@ class AnalyticsRepository(BaseRepository[dict[str, Any]]):
         computed from the ``requests`` table's own terminal statuses.
 
         Args:
+            company_id: Restricts results to this company (tenant) —
+                required, never optional.
             request_type: Restrict to this request type, if provided.
             created_after: Restrict to requests created at or after this
                 timestamp, if provided.
@@ -227,87 +269,33 @@ class AnalyticsRepository(BaseRepository[dict[str, Any]]):
         Returns:
             An ``ApprovalThroughput`` summarizing the matching population.
         """
-        request_builder = self._query().select("id, status").is_("deleted_at", "null")
-        request_builder = self._apply_common_filters(
-            request_builder,
-            department=None,
-            request_type=request_type,
-            created_after=created_after,
-            created_before=created_before,
+        response = self._execute(
+            self._client.rpc(
+                "analytics_approval_throughput",
+                {
+                    "p_company_id": str(company_id),
+                    "p_request_type": request_type,
+                    "p_created_after": _iso(created_after),
+                    "p_created_before": _iso(created_before),
+                },
+            ),
+            operation="approval_throughput",
         )
-        request_response = self._execute(request_builder, operation="approval_throughput_requests")
-        request_rows = self._rows(request_response)
-        request_ids = [row["id"] for row in request_rows]
-        completed_count = sum(
-            1 for row in request_rows if row["status"] == RequestStatus.COMPLETED.value
-        )
-        rejected_count = sum(
-            1 for row in request_rows if row["status"] == RequestStatus.REJECTED.value
-        )
+        # The function always returns exactly one row (it cross-joins two
+        # single-row CTEs, never a `group by` that could yield zero) —
+        # `_single_row` communicates that invariant and gives a clear
+        # error if it's ever violated, rather than a bare `rows[0]`.
+        row = self._single_row(response, identifier=company_id)
+        completed_count = row["completed_count"]
+        rejected_count = row["rejected_count"]
         completion_rate: float | None = None
         terminal_total = completed_count + rejected_count
         if terminal_total > 0:
             completion_rate = completed_count / terminal_total
 
-        average_decision_seconds: float | None = None
-        if request_ids:
-            stage_response = self._execute(
-                self._client.table("workflow_stages")
-                .select("created_at, decided_at, status")
-                .in_("request_id", request_ids)
-                .in_(
-                    "status",
-                    [StageStatus.APPROVED.value, StageStatus.REJECTED.value],
-                ),
-                operation="approval_throughput_stages",
-            )
-            stage_rows = self._rows(stage_response)
-            durations: list[float] = []
-            for row in stage_rows:
-                if row.get("decided_at") is None:
-                    continue
-                created = datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))
-                decided = datetime.fromisoformat(row["decided_at"].replace("Z", "+00:00"))
-                durations.append((decided - created).total_seconds())
-            if durations:
-                average_decision_seconds = sum(durations) / len(durations)
-
         return ApprovalThroughput(
-            average_decision_seconds=average_decision_seconds,
+            average_decision_seconds=row["average_decision_seconds"],
             completed_count=completed_count,
             rejected_count=rejected_count,
             completion_rate=completion_rate,
         )
-
-    def _apply_common_filters(
-        self,
-        builder: Any,
-        *,
-        department: str | None,
-        request_type: str | None,
-        created_after: datetime | None,
-        created_before: datetime | None,
-    ) -> Any:
-        """Apply the filter set shared by every aggregate method above.
-
-        Args:
-            builder: A query builder already scoped with a ``.select(...)``.
-            department: Restrict to this department, if provided.
-            request_type: Restrict to this request type, if provided.
-            created_after: Restrict to rows created at or after this
-                timestamp, if provided.
-            created_before: Restrict to rows created at or before this
-                timestamp, if provided.
-
-        Returns:
-            The same builder, with filters applied.
-        """
-        if department is not None:
-            builder = builder.eq("department", department)
-        if request_type is not None:
-            builder = builder.eq("request_type", request_type)
-        if created_after is not None:
-            builder = builder.gte("created_at", created_after.isoformat())
-        if created_before is not None:
-            builder = builder.lte("created_at", created_before.isoformat())
-        return builder

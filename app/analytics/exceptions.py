@@ -61,3 +61,23 @@ class InvalidTimeRangeError(AnalyticsError):
         )
         self.created_after = created_after
         self.created_before = created_before
+
+
+def validate_date_range(created_after: datetime | None, created_before: datetime | None) -> None:
+    """Validate that a caller-supplied date range is internally consistent.
+
+    Shared by every engine in this package that accepts an optional
+    ``created_after``/``created_before`` pair (``AnalyticsEngine``,
+    ``OperationalAnalyticsEngine``), so this one rule is expressed exactly
+    once rather than re-derived per engine.
+
+    Args:
+        created_after: The lower bound, if provided.
+        created_before: The upper bound, if provided.
+
+    Raises:
+        InvalidTimeRangeError: If both bounds are provided and
+            ``created_after`` is later than ``created_before``.
+    """
+    if created_after is not None and created_before is not None and created_after > created_before:
+        raise InvalidTimeRangeError(created_after, created_before)

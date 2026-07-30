@@ -6,6 +6,16 @@
 **Author:** Principal QA Architect
 **Testing Framework:** pytest (the project's sole test runner, per the fixed technology stack)
 
+> **Superseded note:** Written against the original Streamlit-based
+> Presentation Layer (`src/ui`), which has since been fully replaced by a
+> FastAPI backend (`app/`, tested with pytest exactly as described below)
+> plus a separate Next.js/React frontend (`frontend/`, tested with
+> Vitest + Testing Library — a second test runner this document predates).
+> The pyramid shape and per-layer coverage philosophy below still apply to
+> the backend; the frontend now has its own genuine automated test suite,
+> not just the "manual/exploratory only" Presentation Layer this document
+> describes.
+
 ---
 
 ## Table of Contents

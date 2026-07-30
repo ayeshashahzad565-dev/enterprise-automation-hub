@@ -22,9 +22,10 @@ depending on the other's internals.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable, Mapping, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 __all__ = [
     "ExecutionContext",
@@ -311,6 +312,16 @@ class JobStatistics:
         skipped_overlap_count: The number of times this job's trigger
             fired while a previous execution was still running, and was
             therefore skipped.
+        skipped_not_leader_count: The number of times this job's trigger
+            fired while this instance did not hold Scheduler leadership
+            (``app.scheduler.leader_election.LeaderElection``), and was
+            therefore skipped without even attempting the job.
+        skipped_distributed_lock_count: The number of times this job's
+            trigger fired, this instance believed itself to be the
+            leader, but another instance already held this specific
+            job's distributed execution lock — cross-instance duplicate-
+            job prevention catching a case leader election alone did
+            not (see ``docs/scheduler_distributed_coordination.md``).
         currently_running: Whether an execution of this job is in
             progress right now.
         last_started_at: The start time of the most recent execution.
@@ -327,6 +338,8 @@ class JobStatistics:
     success_count: int = 0
     failure_count: int = 0
     skipped_overlap_count: int = 0
+    skipped_not_leader_count: int = 0
+    skipped_distributed_lock_count: int = 0
     currently_running: bool = False
     last_started_at: datetime | None = None
     last_finished_at: datetime | None = None

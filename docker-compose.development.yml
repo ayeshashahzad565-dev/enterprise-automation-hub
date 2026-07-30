@@ -1,0 +1,105 @@
+# Local development stack — an alternative to running `uvicorn --reload`
+# and `next dev` directly on the host (both remain fully supported and
+# documented; nothing about this file changes that). Bind-mounts source
+# so edits take effect without rebuilding the image.
+#
+# Usage:
+#   cp .env.example .env
+#   cp frontend/.env.local.example frontend/.env.local
+#   docker compose -f docker-compose.development.yml up --build
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks: [eah-dev]
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # The `builder` stage already has every production dependency
+      # installed into /opt/venv (see Dockerfile) but hasn't copied any
+      # application source — that's supplied by the bind mount below
+      # instead, so edits to app/ are picked up by --reload without a
+      # rebuild.
+      target: builder
+    working_dir: /app
+    command:
+      [
+        "uvicorn",
+        "app.api.main:create_app",
+        "--factory",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--reload",
+      ]
+    env_file: .env
+    environment:
+      APP_ENVIRONMENT: development
+      REDIS_URL: redis://redis:6379/0
+      # With Redis configured, "true" means "opt into the Scheduler pool"
+      # (docs/scheduler_distributed_coordination.md) — trivially elected
+      # leader here since this is the only participating instance in this
+      # single-node dev stack.
+      SCHEDULER_LEADER: "true"
+    volumes:
+      - ./app:/app/app
+      - ./alembic.ini:/app/alembic.ini
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+    networks: [eah-dev]
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: builder
+    working_dir: /app
+    # --role all: consumes every queue from one process, matching this
+    # file's "everything in one place" simplicity — the production stack
+    # (docker-compose.production.yml) is where the two dedicated
+    # worker-default/worker-escalation roles actually matter.
+    command: ["python", "-m", "app.jobs.worker", "--role", "all"]
+    env_file: .env
+    environment:
+      APP_ENVIRONMENT: development
+      REDIS_URL: redis://redis:6379/0
+      EMAIL_DISPATCH_MODE: queue
+      SCHEDULER_LEADER: "false"
+    volumes:
+      - ./app:/app/app
+      - ./alembic.ini:/app/alembic.ini
+    depends_on:
+      - redis
+    networks: [eah-dev]
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      # The `deps` stage has node_modules (including devDependencies)
+      # installed but no application source copied in — `next dev` reads
+      # it from the bind mount below.
+      target: deps
+    working_dir: /app
+    command: ["npm", "run", "dev"]
+    env_file: frontend/.env.local
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    networks: [eah-dev]
+
+networks:
+  eah-dev:
+    driver: bridge

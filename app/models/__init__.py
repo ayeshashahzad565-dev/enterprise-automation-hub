@@ -22,6 +22,7 @@ from app.models.approval import (
     EscalationOutcome,
     RejectionDecisionRequest,
 )
+from app.models.attachment import Attachment
 from app.models.audit import AuditLogCreate, AuditLogEntry
 from app.models.base import (
     EAHBaseModel,
@@ -33,9 +34,15 @@ from app.models.base import (
     UTCDatetime,
     VersionedModel,
 )
+from app.models.comment import Comment, CommentCreate
 from app.models.enums import (
     AssignmentStrategy,
+    AttachmentScanStatus,
     AuditAction,
+    EffectiveInvitationStatus,
+    InvitationStatus,
+    JobPriority,
+    JobStatus,
     NotificationType,
     RequestStatus,
     StageStatus,
@@ -48,7 +55,10 @@ from app.models.exceptions import (
     InvalidStageConfigurationError,
     InvalidWorkflowDefinitionError,
 )
+from app.models.invitation import Invitation, InvitationCreate
+from app.models.job import Job, JobCreate
 from app.models.notification import Notification, NotificationCreate
+from app.models.notification_preference import NotificationPreference, NotificationPreferenceUpdate
 from app.models.request import Request, RequestCreate, RequestUpdate
 from app.models.user import Profile, ProfileCreate, ProfileUpdate
 from app.models.workflow import (
@@ -69,6 +79,8 @@ __all__ = [
     "ApprovalOutcome",
     "EscalationOutcome",
     "RejectionDecisionRequest",
+    # attachment
+    "Attachment",
     # audit
     "AuditLogCreate",
     "AuditLogEntry",
@@ -81,9 +93,17 @@ __all__ = [
     "UpdatableTimestampModel",
     "UTCDatetime",
     "VersionedModel",
+    # comment
+    "Comment",
+    "CommentCreate",
     # enums
     "AssignmentStrategy",
+    "AttachmentScanStatus",
     "AuditAction",
+    "EffectiveInvitationStatus",
+    "InvitationStatus",
+    "JobPriority",
+    "JobStatus",
     "NotificationType",
     "RequestStatus",
     "StageStatus",
@@ -94,9 +114,17 @@ __all__ = [
     "InvalidDecisionError",
     "InvalidStageConfigurationError",
     "InvalidWorkflowDefinitionError",
+    # invitation
+    "Invitation",
+    "InvitationCreate",
+    # job
+    "Job",
+    "JobCreate",
     # notification
     "Notification",
     "NotificationCreate",
+    "NotificationPreference",
+    "NotificationPreferenceUpdate",
     # request
     "Request",
     "RequestCreate",

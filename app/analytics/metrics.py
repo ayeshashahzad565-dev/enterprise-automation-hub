@@ -15,24 +15,33 @@ than substituting a default or estimated value.
 
 from __future__ import annotations
 
+import statistics
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Callable, Generic, Mapping, Sequence, TypeVar
+from datetime import datetime
+from typing import Any, Generic, TypeVar
 
 from app.analytics.exceptions import MetricCalculationError
 from app.analytics.interfaces import MetricCalculator
 from app.models.enums import RequestStatus
+from app.utils.datetime_utils import seconds_between
 
 __all__ = [
     "average",
+    "median",
     "total_requests",
     "active_requests",
     "completed_requests",
     "rejected_requests",
     "completion_rate",
+    "rejection_rate",
     "average_approval_time_seconds",
     "average_stage_duration_seconds",
     "approval_latency_seconds",
     "workflow_throughput_per_day",
+    "compliance_rate",
+    "efficiency_score",
+    "period_days",
     "CallableMetricCalculator",
     "MetricRegistry",
 ]
@@ -63,6 +72,24 @@ def average(values: Sequence[float]) -> float | None:
     if not materialized:
         return None
     return sum(materialized) / len(materialized)
+
+
+def median(values: Sequence[float]) -> float | None:
+    """Compute the median of a sequence of numbers.
+
+    Args:
+        values: The values to find the median of.
+
+    Returns:
+        The median, or ``None`` if ``values`` is empty (the same
+        empty-population convention ``average`` uses, for the same
+        reason — an empty population is a normal, expected outcome for
+        many scoped queries, not an error).
+    """
+    materialized = list(values)
+    if not materialized:
+        return None
+    return statistics.median(materialized)
 
 
 def total_requests(status_breakdown: Mapping[RequestStatus, int]) -> int:
@@ -131,6 +158,29 @@ def completion_rate(completed_count: int, rejected_count: int) -> float | None:
     if terminal_total == 0:
         return None
     return completed_count / terminal_total
+
+
+def rejection_rate(completed_count: int, rejected_count: int) -> float | None:
+    """Compute the fraction of terminal requests that were rejected.
+
+    The complement of ``completion_rate`` over the same terminal
+    population (``1 - completion_rate``), exposed as its own named
+    function because "rejection rate" is a distinct term in this
+    system's reporting vocabulary, used directly rather than requiring
+    every caller to re-derive it from ``completion_rate``.
+
+    Args:
+        completed_count: The number of completed requests.
+        rejected_count: The number of rejected requests.
+
+    Returns:
+        ``rejected_count / (completed_count + rejected_count)``, or
+        ``None`` if neither occurred (avoiding a division by zero).
+    """
+    terminal_total = completed_count + rejected_count
+    if terminal_total == 0:
+        return None
+    return rejected_count / terminal_total
 
 
 def average_approval_time_seconds(average_decision_seconds: float | None) -> float | None:
@@ -212,6 +262,80 @@ def workflow_throughput_per_day(completed_count: int, period_days: float | None)
     if period_days is None or period_days <= 0:
         return None
     return completed_count / period_days
+
+
+def compliance_rate(in_sla_count: int, breached_count: int) -> float | None:
+    """Compute the fraction of a decided/evaluated population that met its SLA.
+
+    Used by the Operational Analytics Layer's SLA Engine (Milestone 12)
+    to turn a raw breach count into the "SLA compliance percentage"
+    figure: the fraction of stages decided at-or-before their own
+    configured ``escalation_hours`` threshold, over every stage evaluated
+    (decided or currently overdue-and-pending).
+
+    Args:
+        in_sla_count: The number of items that met their threshold.
+        breached_count: The number of items that missed their threshold.
+
+    Returns:
+        ``in_sla_count / (in_sla_count + breached_count)``, or ``None``
+        if no item was evaluated at all (avoiding a division by zero).
+    """
+    evaluated_total = in_sla_count + breached_count
+    if evaluated_total == 0:
+        return None
+    return in_sla_count / evaluated_total
+
+
+def efficiency_score(
+    completion_rate_value: float | None, sla_compliance_value: float | None
+) -> float | None:
+    """Compute a single, deterministic "workflow efficiency" composite score.
+
+    Defined transparently as the product of two already-computed, real
+    fractions — ``completion_rate`` (terminal requests that succeeded
+    rather than being rejected) and SLA compliance (decisions made within
+    their configured threshold) — so the result is always explainable
+    from its two real inputs, never a fabricated or estimated figure.
+    Both inputs already lie in ``[0, 1]``, so the product does too.
+
+    Args:
+        completion_rate_value: The population's completion rate, or
+            ``None`` if unavailable.
+        sla_compliance_value: The population's SLA compliance rate, or
+            ``None`` if unavailable.
+
+    Returns:
+        ``completion_rate_value * sla_compliance_value``, or ``None`` if
+        either input is unavailable — never a partial or estimated score
+        computed from only one of the two.
+    """
+    if completion_rate_value is None or sla_compliance_value is None:
+        return None
+    return completion_rate_value * sla_compliance_value
+
+
+def period_days(created_after: datetime | None, created_before: datetime | None) -> float | None:
+    """Compute the length, in days, of a caller-supplied date range.
+
+    Shared by every engine in this package that computes a "per day"
+    throughput figure (``AnalyticsEngine``, ``OperationalAnalyticsEngine``),
+    so this one rule — no default period is ever assumed, and a
+    sub-daily range is treated as one day rather than a fraction, to
+    keep a throughput calculation meaningful — is expressed exactly once.
+
+    Args:
+        created_after: The lower bound, if provided.
+        created_before: The upper bound, if provided.
+
+    Returns:
+        The number of days between the two bounds (never less than one)
+        if both are provided; ``None`` if either bound is missing.
+    """
+    if created_after is not None and created_before is not None:
+        days = seconds_between(created_after, created_before) / 86400.0
+        return days if days >= 1.0 else 1.0
+    return None
 
 
 @dataclass(frozen=True, slots=True)

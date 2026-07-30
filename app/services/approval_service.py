@@ -22,7 +22,9 @@ notifications after commit.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from uuid import UUID
 
 from app.auth.authentication import AuthenticatedIdentity
@@ -31,7 +33,7 @@ from app.database.exceptions import DatabaseError, RecordNotFoundError
 from app.database.repositories.approval_repository import ApprovalRepository
 from app.database.repositories.audit_repository import AuditRepository
 from app.database.repositories.base_repository import Page, PagedResult
-from app.database.repositories.request_repository import RequestRepository
+from app.database.repositories.request_repository import RequestRecord, RequestRepository
 from app.database.repositories.user_repository import ProfileRepository
 from app.database.repositories.workflow_repository import (
     WorkflowDefinitionRepository,
@@ -39,7 +41,7 @@ from app.database.repositories.workflow_repository import (
     WorkflowStageRepository,
 )
 from app.models import ApprovalOutcome, WorkflowStage
-from app.models.enums import AuditAction, NotificationType, RequestStatus, StageStatus, UserRole
+from app.models.enums import AuditAction, RequestStatus, StageStatus, UserRole
 from app.services.exceptions import (
     PermissionDeniedError,
     ValidationError,
@@ -288,39 +290,61 @@ class ApprovalService:
             current_assigned_to=stage.assigned_to, current_assigned_role=stage.assigned_role
         )
 
-        try:
-            reassigned = self._approval_repo.escalate_stage(
-                stage_id,
-                expected_version=stage.version,
-                new_assigned_to=plan.new_assigned_to,
-                new_assigned_role=plan.new_assigned_role,
-            )
-        except DatabaseError as exc:
-            raise translate_database_error(exc) from exc
+        with TransactionContext(operation_name="escalate_stage") as tx:
+            try:
+                reassigned = self._approval_repo.escalate_stage(
+                    stage_id,
+                    expected_version=stage.version,
+                    new_assigned_to=plan.new_assigned_to,
+                    new_assigned_role=plan.new_assigned_role,
+                )
+            except DatabaseError as exc:
+                raise translate_database_error(exc) from exc
 
-        try:
-            self._audit_repo.record_event(
-                action=AuditAction.STAGE_ESCALATED,
-                request_id=stage.request_id,
-                metadata={
-                    "stage_id": str(stage_id),
-                    "previous_assigned_to": str(plan.previous_assigned_to)
-                    if plan.previous_assigned_to
-                    else None,
-                    "previous_assigned_role": plan.previous_assigned_role.value
-                    if plan.previous_assigned_role
-                    else None,
-                },
-            )
-        except DatabaseError as exc:
-            raise translate_database_error(exc) from exc
+            def _compensate_escalation() -> None:
+                self._approval_repo.escalate_stage(
+                    stage_id,
+                    expected_version=reassigned.version,
+                    new_assigned_to=plan.previous_assigned_to,
+                    new_assigned_role=plan.previous_assigned_role,
+                )
+
+            tx.register_compensation(_compensate_escalation)
+
+            try:
+                self._audit_repo.record_event(
+                    action=AuditAction.STAGE_ESCALATED,
+                    request_id=stage.request_id,
+                    metadata={
+                        "stage_id": str(stage_id),
+                        "previous_assigned_to": (
+                            str(plan.previous_assigned_to) if plan.previous_assigned_to else None
+                        ),
+                        "previous_assigned_role": (
+                            plan.previous_assigned_role.value
+                            if plan.previous_assigned_role
+                            else None
+                        ),
+                    },
+                )
+            except DatabaseError as exc:
+                raise translate_database_error(exc) from exc
 
         if reassigned.assigned_to is not None:
-            self._notification_service.notify_escalation(
-                recipient_id=reassigned.assigned_to,
-                request_id=stage.request_id,
-                message=f"Stage '{stage.stage_name}' has been escalated to you.",
-            )
+            try:
+                self._notification_service.notify_escalation(
+                    recipient_id=reassigned.assigned_to,
+                    request_id=stage.request_id,
+                    message=f"Stage '{stage.stage_name}' has been escalated to you.",
+                )
+            except Exception:  # noqa: BLE001 - best-effort side effect, see _decide_stage's identical treatment
+                self._logger.error(
+                    "Failed to dispatch escalation notification for stage %s; the "
+                    "escalation itself already committed successfully and is not affected.",
+                    stage_id,
+                    exc_info=True,
+                    extra={"stage_id": str(stage_id)},
+                )
 
         return map_workflow_stage_record_to_domain(reassigned)
 
@@ -347,7 +371,10 @@ class ApprovalService:
 
         try:
             result = self._approval_repo.list_pending_for_approver(
-                assigned_to=identity.user_id, assigned_role=identity.role, page=page
+                company_id=identity.company_id,
+                assigned_to=identity.user_id,
+                assigned_role=identity.role,
+                page=page,
             )
         except DatabaseError as exc:
             raise translate_database_error(exc) from exc
@@ -382,9 +409,26 @@ class ApprovalService:
             The resulting ``ApprovalOutcome``.
         """
         try:
-            stage = self._workflow_stage_repo.get_by_id(stage_id)
+            stage = self._workflow_stage_repo.get_by_id_for_company(
+                stage_id, company_id=identity.company_id
+            )
         except RecordNotFoundError as exc:
             raise translate_database_error(exc) from exc
+
+        # Idempotent-replay short-circuit: if this exact caller already
+        # decided this exact stage to this exact target status, this is a
+        # retry (the client's original response was lost, e.g. to a
+        # network drop) of a decision that already fully committed, not a
+        # new decision. Returning the existing outcome — rather than
+        # re-running authorization/the state-machine check/any write —
+        # is what makes such a retry safe: without this, the caller would
+        # instead see a confusing "stage not pending" authorization error
+        # for an action that, from their perspective, is their first and
+        # only attempt. A different actor, or a different target status,
+        # is a genuine conflict and falls through to the normal path
+        # below unchanged.
+        if stage.status is target_stage_status and stage.decided_by == identity.user_id:
+            return self._replay_idempotent_decision(stage)
 
         try:
             authorize_stage_decision(
@@ -405,7 +449,7 @@ class ApprovalService:
 
         version_to_use = expected_version if expected_version is not None else stage.version
 
-        with TransactionContext(operation_name=f"decide_stage_{target_stage_status.value}"):
+        with TransactionContext(operation_name=f"decide_stage_{target_stage_status.value}") as tx:
             if target_stage_status is StageStatus.APPROVED:
                 try:
                     decided_stage = self._approval_repo.approve_stage(
@@ -416,7 +460,8 @@ class ApprovalService:
                     )
                 except DatabaseError as exc:
                     raise translate_database_error(exc) from exc
-                advancement = self._advance_after_approval(stage, decided_stage)
+                tx.register_compensation(self._compensate_decision(stage_id, decided_stage))
+                advancement = self._advance_after_approval(stage, tx)
             else:
                 try:
                     decided_stage = self._approval_repo.reject_stage(
@@ -427,7 +472,8 @@ class ApprovalService:
                     )
                 except DatabaseError as exc:
                     raise translate_database_error(exc) from exc
-                advancement = self._finalize_rejection(stage)
+                tx.register_compensation(self._compensate_decision(stage_id, decided_stage))
+                advancement = self._finalize_rejection(stage, tx)
 
             try:
                 self._audit_repo.record_event(
@@ -439,11 +485,20 @@ class ApprovalService:
             except DatabaseError as exc:
                 raise translate_database_error(exc) from exc
 
-        self._dispatch_post_decision_notifications(
-            stage=stage,
-            request_status=advancement.request_status,
-            notify_recipient_id=advancement.notify_recipient_id,
-        )
+        try:
+            self._dispatch_post_decision_notifications(
+                stage=stage,
+                request_status=advancement.request_status,
+                notify_recipient_id=advancement.notify_recipient_id,
+            )
+        except Exception:  # noqa: BLE001 - a best-effort side effect must not undo an already-committed decision
+            self._logger.error(
+                "Failed to dispatch post-decision notification for stage %s; the "
+                "decision itself already committed successfully and is not affected.",
+                stage_id,
+                exc_info=True,
+                extra={"stage_id": str(stage_id)},
+            )
 
         return ApprovalOutcome(
             stage=map_workflow_stage_record_to_domain(decided_stage),
@@ -451,16 +506,143 @@ class ApprovalService:
             current_stage_id=advancement.new_stage_id,
         )
 
-    def _advance_after_approval(
+    def _replay_idempotent_decision(self, stage: WorkflowStageRecord) -> ApprovalOutcome:
+        """Return the outcome of a decision that already fully committed.
+
+        Reconstructed entirely from current state — no write, no
+        authorization check, no state-machine check — since the request's
+        current ``status``/``current_stage_id`` already reflect this exact
+        decision's own effect (the workflow only ever advances forward,
+        so nothing since could have changed them back).
+
+        Args:
+            stage: The already-decided stage, fetched fresh by the caller.
+
+        Returns:
+            The same ``ApprovalOutcome`` the original, successful decision
+            produced.
+        """
+        try:
+            request = self._request_repo.get_by_id(stage.request_id)
+        except RecordNotFoundError as exc:
+            raise translate_database_error(exc) from exc
+        self._logger.info(
+            "Replaying already-committed decision for stage %s (idempotent retry by %s)",
+            stage.id,
+            stage.decided_by,
+            extra={"stage_id": str(stage.id)},
+        )
+        return ApprovalOutcome(
+            stage=map_workflow_stage_record_to_domain(stage),
+            request_status=request.status,
+            current_stage_id=request.current_stage_id,
+        )
+
+    def _compensate_decision(
+        self, stage_id: UUID, decided_stage: WorkflowStageRecord
+    ) -> Callable[[], None]:
+        """Build the compensating action that undoes a stage decision.
+
+        Args:
+            stage_id: The stage's id.
+            decided_stage: The record ``approve_stage``/``reject_stage``
+                just returned — its version pins this compensation to
+                "nothing has touched the row since."
+
+        Returns:
+            A zero-argument callable suitable for
+            ``TransactionContext.register_compensation``.
+        """
+
+        def _compensation() -> None:
+            self._approval_repo.revert_to_pending(stage_id, expected_version=decided_stage.version)
+
+        return _compensation
+
+    def _compensate_stage_creation(self, new_stage: WorkflowStageRecord) -> Callable[[], None]:
+        """Build the compensating action that undoes a just-created stage.
+
+        Args:
+            new_stage: The record ``create_stage`` just returned — its
+                version pins this compensation to "nothing has touched
+                the row since," so a stage another actor raced in and
+                decided in the interim is never destroyed (see
+                ``WorkflowStageRepository.delete_if_unchanged``'s own
+                docstring for that guarantee's exact shape).
+
+        Returns:
+            A zero-argument callable suitable for
+            ``TransactionContext.register_compensation``.
+        """
+
+        def _compensation() -> None:
+            deleted = self._workflow_stage_repo.delete_if_unchanged(
+                new_stage.id, expected_version=new_stage.version
+            )
+            if not deleted:
+                self._logger.warning(
+                    "Could not roll back newly created stage %s — it no longer matched "
+                    "its just-created version, meaning something else already touched it. "
+                    "The rest of this decision's rollback still proceeds, but this stage "
+                    "is left in place.",
+                    new_stage.id,
+                    extra={"stage_id": str(new_stage.id)},
+                )
+
+        return _compensation
+
+    def _compensate_request_advancement(
         self,
-        stage: WorkflowStageRecord,
-        decided_stage: WorkflowStageRecord,
+        request_id: UUID,
+        updated_request: RequestRecord,
+        *,
+        original_current_stage_id: UUID | None,
+        original_status: RequestStatus,
+        original_completed_at: datetime | None,
+    ) -> Callable[[], None]:
+        """Build the compensating action that reverts a request's
+        lifecycle pointer back to what it was before this decision.
+
+        Args:
+            request_id: The request's id.
+            updated_request: The record ``set_current_stage``'s forward
+                call just returned — its version pins this compensation to
+                "nothing has touched the row since."
+            original_current_stage_id: The request's ``current_stage_id``
+                immediately before this decision.
+            original_status: The request's ``status`` immediately before
+                this decision.
+            original_completed_at: The request's ``completed_at``
+                immediately before this decision.
+
+        Returns:
+            A zero-argument callable suitable for
+            ``TransactionContext.register_compensation``.
+        """
+
+        def _compensation() -> None:
+            self._request_repo.set_current_stage(
+                request_id,
+                expected_version=updated_request.version,
+                current_stage_id=original_current_stage_id,
+                status=original_status,
+                completed_at=original_completed_at,
+            )
+
+        return _compensation
+
+    def _advance_after_approval(
+        self, stage: WorkflowStageRecord, tx: TransactionContext
     ) -> _DecisionAdvancement:
         """Determine and persist the request-level consequence of an approval.
 
         Args:
             stage: The stage record as it was before this decision.
-            decided_stage: The stage record as it now stands, post-decision.
+            tx: The enclosing ``TransactionContext`` — every write this
+                method performs registers a compensation on it, so a
+                later failure (a further write here, or the audit write
+                back in ``_decide_stage``) unwinds this method's own
+                effects too, not just the stage decision that preceded it.
 
         Returns:
             A ``_DecisionAdvancement`` describing the request's new
@@ -473,6 +655,12 @@ class ApprovalService:
             request = self._request_repo.get_by_id(stage.request_id)
         except RecordNotFoundError as exc:
             raise translate_database_error(exc) from exc
+
+        # Captured before any mutation below, so a compensation can put the
+        # request back exactly as it was — regardless of which branch runs.
+        original_current_stage_id = request.current_stage_id
+        original_status = request.status
+        original_completed_at = request.completed_at
 
         try:
             definition_record = self._workflow_definition_repo.get_by_id(
@@ -498,9 +686,15 @@ class ApprovalService:
             for s in definition_domain.definition.ordered_stages()
             if s.order == stage.stage_order + 1
         ]
-        if remaining_stage_defs and remaining_stage_defs[0].assignment_strategy is AssignmentStrategy.REQUESTER_MANAGER:
+        if (
+            remaining_stage_defs
+            and remaining_stage_defs[0].assignment_strategy is AssignmentStrategy.REQUESTER_MANAGER
+        ):
             records = self._profile_repo.list_by_role(
-                UserRole.APPROVER, department=requester_domain.department, page=Page(size=100)
+                UserRole.APPROVER,
+                company_id=request.company_id,
+                department=requester_domain.department,
+                page=Page(size=100),
             ).items
             department_approvers = [map_profile_record_to_domain(r) for r in records]
 
@@ -520,7 +714,7 @@ class ApprovalService:
             except EngineWorkflowError as exc:
                 raise translate_workflow_error(exc) from exc
             try:
-                self._request_repo.set_current_stage(
+                updated_request = self._request_repo.set_current_stage(
                     request.id,
                     expected_version=request.version,
                     current_stage_id=None,
@@ -529,6 +723,15 @@ class ApprovalService:
                 )
             except DatabaseError as exc:
                 raise translate_database_error(exc) from exc
+            tx.register_compensation(
+                self._compensate_request_advancement(
+                    request.id,
+                    updated_request,
+                    original_current_stage_id=original_current_stage_id,
+                    original_status=original_status,
+                    original_completed_at=original_completed_at,
+                )
+            )
             return _DecisionAdvancement(
                 request_status=RequestStatus.COMPLETED,
                 new_stage_id=None,
@@ -541,11 +744,13 @@ class ApprovalService:
                 request_id=request.id,
                 stage_order=plan.stage_order,
                 stage_name=plan.stage_name,
+                company_id=request.company_id,
                 assigned_role=plan.assigned_role,
                 assigned_to=plan.assigned_to,
             )
         except DatabaseError as exc:
             raise translate_database_error(exc) from exc
+        tx.register_compensation(self._compensate_stage_creation(new_stage))
 
         try:
             self._workflow_engine.validate_request_status_transition(
@@ -555,7 +760,7 @@ class ApprovalService:
             raise translate_workflow_error(exc) from exc
 
         try:
-            self._request_repo.set_current_stage(
+            updated_request = self._request_repo.set_current_stage(
                 request.id,
                 expected_version=request.version,
                 current_stage_id=new_stage.id,
@@ -563,6 +768,15 @@ class ApprovalService:
             )
         except DatabaseError as exc:
             raise translate_database_error(exc) from exc
+        tx.register_compensation(
+            self._compensate_request_advancement(
+                request.id,
+                updated_request,
+                original_current_stage_id=original_current_stage_id,
+                original_status=original_status,
+                original_completed_at=original_completed_at,
+            )
+        )
 
         # new_stage.id is always populated here: a next stage genuinely
         # was created, regardless of whether plan.assigned_to resolved to
@@ -578,11 +792,15 @@ class ApprovalService:
             audit_action=AuditAction.STAGE_APPROVED,
         )
 
-    def _finalize_rejection(self, stage: WorkflowStageRecord) -> _DecisionAdvancement:
+    def _finalize_rejection(
+        self, stage: WorkflowStageRecord, tx: TransactionContext
+    ) -> _DecisionAdvancement:
         """Terminate a request's workflow following a stage rejection.
 
         Args:
             stage: The stage record as it was before this decision.
+            tx: The enclosing ``TransactionContext`` — the request-level
+                write this method performs registers a compensation on it.
 
         Returns:
             A ``_DecisionAdvancement`` with ``request_status =
@@ -596,6 +814,10 @@ class ApprovalService:
         except RecordNotFoundError as exc:
             raise translate_database_error(exc) from exc
 
+        original_current_stage_id = request.current_stage_id
+        original_status = request.status
+        original_completed_at = request.completed_at
+
         try:
             self._workflow_engine.validate_request_status_transition(
                 request.status, RequestStatus.REJECTED
@@ -604,7 +826,7 @@ class ApprovalService:
             raise translate_workflow_error(exc) from exc
 
         try:
-            self._request_repo.set_current_stage(
+            updated_request = self._request_repo.set_current_stage(
                 request.id,
                 expected_version=request.version,
                 current_stage_id=None,
@@ -613,6 +835,15 @@ class ApprovalService:
             )
         except DatabaseError as exc:
             raise translate_database_error(exc) from exc
+        tx.register_compensation(
+            self._compensate_request_advancement(
+                request.id,
+                updated_request,
+                original_current_stage_id=original_current_stage_id,
+                original_status=original_status,
+                original_completed_at=original_completed_at,
+            )
+        )
 
         return _DecisionAdvancement(
             request_status=RequestStatus.REJECTED,

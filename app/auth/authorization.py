@@ -54,6 +54,7 @@ __all__ = [
     "authorize_workflow_definition_management",
     "authorize_audit_trail_view",
     "authorize_user_role_management",
+    "authorize_platform_admin",
 ]
 
 logger = logging.getLogger(__name__)
@@ -316,6 +317,31 @@ def authorize_user_role_management(identity: AuthenticatedIdentity) -> None:
     _ensure_not_expired(identity)
     if not rbac.can_manage_user_roles(identity.role):
         raise rbac_permission_denied(identity.role, "manage_user_roles")
+
+
+def authorize_platform_admin(identity: AuthenticatedIdentity) -> None:
+    """Enforce that an identity may perform a platform-only operation.
+
+    Deliberately orthogonal to the ``UserRole``/``rbac`` system this
+    module otherwise delegates to entirely: platform administration
+    (creating/listing/deactivating a company; inviting a company's first
+    user before it has any admin of its own) is a capability above
+    company-scoped ``UserRole.ADMIN``, not a superset of it — a platform
+    admin's own company-scoped business permissions are unaffected by
+    this check, and this check grants nothing beyond the handful of
+    platform-only endpoints that call it.
+
+    Args:
+        identity: The already-authenticated caller.
+
+    Raises:
+        SessionExpiredError: If ``identity``'s token has expired.
+        PermissionDeniedError: If ``identity.is_platform_admin`` is
+            ``False``.
+    """
+    _ensure_not_expired(identity)
+    if not identity.is_platform_admin:
+        raise rbac_permission_denied(identity.role, "platform_admin")
 
 
 def rbac_permission_denied(role: UserRole, permission_name: str):

@@ -15,7 +15,7 @@ proceed, without performing the transaction itself.
 from __future__ import annotations
 
 import logging
-from typing import Sequence
+from collections.abc import Sequence
 
 from app.models import WorkflowDefinition
 from app.workflow.exceptions import (

@@ -17,7 +17,7 @@ from typing import Any
 from uuid import UUID
 
 from app.database.client import DatabaseClient
-from app.database.exceptions import ConcurrentUpdateError, InvalidQueryError
+from app.database.exceptions import InvalidQueryError
 from app.database.repositories.base_repository import BaseRepository, Page, PagedResult
 from app.database.repositories.user_repository import UserRole
 from app.database.repositories.workflow_repository import (
@@ -39,8 +39,8 @@ class ApprovalRepository(BaseRepository[WorkflowStageRecord]):
 
     table_name = "workflow_stages"
 
-    def __init__(self, client: DatabaseClient) -> None:
-        super().__init__(client)
+    def __init__(self, client: DatabaseClient, *, always_use_injected_client: bool) -> None:
+        super().__init__(client, always_use_injected_client=always_use_injected_client)
 
     def approve_stage(
         self,
@@ -144,34 +144,97 @@ class ApprovalRepository(BaseRepository[WorkflowStageRecord]):
             mapper=_map_workflow_stage_row,
         )
 
+    def revert_to_pending(
+        self,
+        stage_id: UUID,
+        *,
+        expected_version: int,
+    ) -> WorkflowStageRecord:
+        """Undo a decision, returning the stage to a genuine ``pending`` state.
+
+        The compensating counterpart to ``approve_stage``/``reject_stage``,
+        used exclusively by ``ApprovalService``'s ``TransactionContext``
+        when a later step in the same decision (stage creation, request
+        advancement, or the audit write) fails — so a partially-applied
+        decision never leaves a stage stuck ``approved``/``rejected`` with
+        no corresponding request-level effect. Clears every decision-
+        specific column (``decided_by``, ``decided_at``, ``decision_note``),
+        not just ``status``, so the reverted row is indistinguishable from
+        one that was never decided at all.
+
+        Args:
+            stage_id: The stage's ``id``.
+            expected_version: The version the forward decision call
+                returned — this compensation only applies if nothing has
+                touched the row since.
+
+        Returns:
+            The reverted ``WorkflowStageRecord``, with
+            ``status = StageStatus.PENDING`` and every decision field
+            cleared.
+
+        Raises:
+            ConcurrentUpdateError: If ``expected_version`` no longer
+                matches the row's current version — for example, another
+                actor already decided this stage between the original
+                decision and this rollback attempt. Left to the caller
+                (``TransactionContext.__exit__`` logs and continues rather
+                than raising further) rather than silently swallowed here,
+                since a repository method's job is to report exactly what
+                happened, not to decide how a caller should react to it.
+        """
+        values: dict[str, Any] = {
+            "status": StageStatus.PENDING.value,
+            "decided_by": None,
+            "decided_at": None,
+            "decision_note": None,
+        }
+        return self.update_with_optimistic_lock(
+            stage_id,
+            expected_version=expected_version,
+            values=values,
+            mapper=_map_workflow_stage_row,
+        )
+
     def escalate_stage(
         self,
         stage_id: UUID,
         *,
         expected_version: int,
         new_assigned_to: UUID | None,
-        new_assigned_role: UserRole,
+        new_assigned_role: UserRole | None,
     ) -> WorkflowStageRecord:
         """Reassign an overdue, still-pending stage (WEDD Section 8.4).
 
-        Invoked exclusively by the Scheduler's Escalation Check job
-        (WEDD Section 8.5), using the same optimistic-locking predicate
-        as a human decision, so that an escalation attempt racing against
-        a just-arrived human decision is safely rejected rather than
-        overwriting it (WEDD Section 12.5).
+        Invoked by the Scheduler's Escalation Check job (WEDD Section
+        8.5), using the same optimistic-locking predicate as a human
+        decision, so that an escalation attempt racing against a
+        just-arrived human decision is safely rejected rather than
+        overwriting it (WEDD Section 12.5) — and, symmetrically, by
+        ``ApprovalService.escalate_stage``'s own compensation, to restore
+        a stage's exact pre-escalation assignment if a later step (the
+        audit write) fails. ``new_assigned_role`` accepts ``None`` for
+        that second caller's sake: a stage escalated forward always
+        resolves to a concrete eligible role (never ``None``, per WEDD
+        Section 7.5/8.4), but the assignment *being reverted to* may
+        legitimately have been a specific-user-only assignment with no
+        role fallback at all — the same shape ``create_stage`` already
+        accepts for this column.
 
         This method does not change ``status`` — a stage remains
         ``pending`` after escalation, only its assignment changes.
 
         Args:
             stage_id: The stage's ``id``.
-            expected_version: The version last observed by the Scheduler
-                job at query time.
+            expected_version: The version last observed by the caller at
+                query time.
             new_assigned_to: The new specific assignee, if resolved, or
                 ``None`` if escalating to a role-eligible pool.
             new_assigned_role: The new eligible role (typically
                 ``UserRole.ADMIN``, per WEDD Section 7.5's fallback and
-                Section 8.4's escalation routing).
+                Section 8.4's escalation routing), or ``None`` when
+                restoring a specific-user-only assignment that had no
+                role fallback.
 
         Returns:
             The updated ``WorkflowStageRecord``, with ``status`` unchanged
@@ -185,7 +248,7 @@ class ApprovalRepository(BaseRepository[WorkflowStageRecord]):
         """
         values: dict[str, Any] = {
             "assigned_to": str(new_assigned_to) if new_assigned_to else None,
-            "assigned_role": new_assigned_role.value,
+            "assigned_role": new_assigned_role.value if new_assigned_role else None,
         }
         return self.update_with_optimistic_lock(
             stage_id,
@@ -197,11 +260,12 @@ class ApprovalRepository(BaseRepository[WorkflowStageRecord]):
     def list_pending_for_approver(
         self,
         *,
+        company_id: UUID,
         assigned_to: UUID | None = None,
         assigned_role: UserRole | None = None,
         page: Page = Page(),
     ) -> PagedResult[WorkflowStageRecord]:
-        """List pending stages assigned to a specific user or role.
+        """List pending stages assigned to a specific user or role, within a company.
 
         Corresponds to ``GET /api/v1/approvals/pending`` (API-ADD Section
         19.5.3), backed by the composite index on ``(assigned_to,
@@ -210,9 +274,14 @@ class ApprovalRepository(BaseRepository[WorkflowStageRecord]):
         stages the authenticated caller may see (DSD Section 9.2); when
         called against a service-role client (for example, by the
         Scheduler), no such restriction applies and the caller must
-        supply explicit filters.
+        supply explicit filters — ``company_id`` is this method's own
+        such filter, required (not optional) since this is the one
+        stage-read query with no ``request_id`` in hand to otherwise
+        scope it, and a role/eligible-pool match could otherwise span
+        companies.
 
         Args:
+            company_id: Restricts results to this company (tenant).
             assigned_to: Restrict to stages assigned to this specific
                 user, if provided.
             assigned_role: Restrict to stages eligible for this role, if
@@ -227,16 +296,41 @@ class ApprovalRepository(BaseRepository[WorkflowStageRecord]):
             InvalidQueryError: If neither ``assigned_to`` nor
                 ``assigned_role`` is provided, which would otherwise
                 return every pending stage in the system unfiltered.
+
+        Note (Milestone 9 Search/Filter Injection audit): the ``.or_()``
+        call below interpolates ``assigned_to``/``assigned_role``
+        unescaped/unquoted, unlike the free-text-search ``.or_()`` calls
+        this audit fixed elsewhere (``RequestRepository.search_requests``,
+        ``InvitationRepository.list_invitations``). This is safe, not an
+        oversight: both values are strictly typed (a ``UUID`` and a
+        closed ``UserRole`` enum, never caller-supplied free text), so
+        neither can ever contain a comma/period/parenthesis capable of
+        altering the filter-string structure — the class of risk
+        ``quote_postgrest_filter_value`` (``base_repository.py``) exists
+        to close. Reviewed and left unchanged.
         """
         if assigned_to is None and assigned_role is None:
             raise InvalidQueryError(
                 "list_pending_for_approver requires at least one of "
                 "assigned_to or assigned_role."
             )
-        builder = self._query().eq("status", StageStatus.PENDING.value)
-        if assigned_to is not None:
+        builder = self._scoped_query(company_id=company_id).eq("status", StageStatus.PENDING.value)
+        # A stage is assigned to EITHER a specific user OR a role-eligible
+        # pool, never both at once (assignment_resolver.py) — so when both
+        # arguments are supplied, this must be an OR: "assigned to me by
+        # name, or eligible via my role," not an AND. Chaining two .eq()
+        # calls here would silently require both columns to match the
+        # caller simultaneously, which no stage row ever does, causing
+        # every approver's queue to return zero rows regardless of how
+        # many stages were actually assigned to them.
+        if assigned_to is not None and assigned_role is not None:
+            builder = builder.or_(
+                f"assigned_to.eq.{assigned_to},assigned_role.eq.{assigned_role.value}"
+            )
+        elif assigned_to is not None:
             builder = builder.eq("assigned_to", str(assigned_to))
-        if assigned_role is not None:
+        else:
+            assert assigned_role is not None  # narrows for the branch below
             builder = builder.eq("assigned_role", assigned_role.value)
         builder = builder.order("created_at")
         return self.paginate(builder, page, mapper=_map_workflow_stage_row)
@@ -245,17 +339,55 @@ class ApprovalRepository(BaseRepository[WorkflowStageRecord]):
         self,
         *,
         created_before: datetime,
+        company_id: UUID,
         page: Page = Page(size=100),
     ) -> PagedResult[WorkflowStageRecord]:
-        """List pending stages created before a given threshold timestamp.
+        """List a single company's pending stages created before a given threshold.
 
-        Used by the Scheduler's Escalation Check and Reminder Dispatch
-        jobs (WEDD Section 8.3), which compute the threshold externally
-        (from a stage's ``created_at`` plus the workflow definition's
-        configured ``escalation_hours``, per WEDD Section 8.2) and pass
-        it in here as an absolute timestamp — this repository performs no
-        duration arithmetic itself, keeping that computation in the
-        Workflow Engine's ``EscalationPlanner`` where it belongs.
+        ``company_id`` is mandatory — unlike every other company-scoped
+        filter in this package. The one legitimate exception, the
+        Scheduler's organization-wide escalation sweep (WEDD Section
+        8.3), uses the separate, explicitly-named
+        ``list_overdue_stages_all_companies`` instead, so an unscoped
+        cross-tenant query is a deliberate, named choice at the call
+        site rather than something a caller can reach silently by
+        omitting an optional parameter.
+
+        Args:
+            created_before: Only stages created at or before this
+                timestamp are returned.
+            company_id: Restricts results to this company (tenant).
+            page: The page to retrieve. Defaults to a page size of 100 to
+                efficiently batch-process a Scheduler run.
+
+        Returns:
+            A ``PagedResult`` of pending stages older than the threshold,
+            oldest first.
+        """
+        builder = (
+            self._scoped_query(company_id=company_id)
+            .eq("status", StageStatus.PENDING.value)
+            .lte("created_at", created_before.isoformat())
+        )
+        builder = builder.order("created_at")
+        return self.paginate(builder, page, mapper=_map_workflow_stage_row)
+
+    def list_overdue_stages_all_companies(
+        self,
+        *,
+        created_before: datetime,
+        page: Page = Page(size=100),
+    ) -> PagedResult[WorkflowStageRecord]:
+        """List every company's pending stages created before a given threshold.
+
+        The one legitimate, organization-wide counterpart to
+        ``list_overdue_stages`` — used exclusively by the Scheduler's
+        Escalation Check and Reminder Dispatch jobs (WEDD Section 8.3),
+        which compute the threshold externally (from a stage's
+        ``created_at`` plus the workflow definition's configured
+        ``escalation_hours``, per WEDD Section 8.2) and must reach every
+        company's overdue stages in one pass. Every other caller (e.g.
+        the Analytics Layer) uses ``list_overdue_stages`` instead.
 
         Args:
             created_before: Only stages created at or before this
@@ -265,12 +397,12 @@ class ApprovalRepository(BaseRepository[WorkflowStageRecord]):
 
         Returns:
             A ``PagedResult`` of pending stages older than the threshold,
-            oldest first.
+            across every company, oldest first.
         """
         builder = (
-            self._query()
+            self._select("*", count="exact")  # tenant-scope-exempt: deliberate cross-tenant Scheduler sweep, see docstring
             .eq("status", StageStatus.PENDING.value)
             .lte("created_at", created_before.isoformat())
-            .order("created_at")
         )
+        builder = builder.order("created_at")
         return self.paginate(builder, page, mapper=_map_workflow_stage_row)
