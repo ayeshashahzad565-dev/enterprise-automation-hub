@@ -202,9 +202,9 @@ snapshot — each would be a behavioral/architectural change, not polish:
 3. **`/platform`'s 116 kB own route bundle** (before the 103 kB shared
    chunk) is the largest individual route bundle in the app — worth
    profiling in a dedicated performance pass.
-4. **`DEPLOYMENT_REPORT.md` and `PROJECT_SUMMARY.md`** at the repo root are
-   dated, point-in-time generated snapshots (2026-07-25 and 2026-07-19
+4. **`docs/history/deployment_report.md` and `docs/history/project_summary.md`**
+   are dated, point-in-time generated snapshots (2026-07-25 and 2026-07-19
    respectively), not living documentation referenced from the README's
-   Documentation Index. Left untouched as historical artifacts rather than
-   edited in place; a future cleanup could archive them under `docs/history/`
-   or delete them once their content is fully absorbed elsewhere.
+   Documentation Index. Archived under `docs/history/` as of 2026-08-04
+   rather than edited in place; a future cleanup could delete them once
+   their content is fully absorbed elsewhere.

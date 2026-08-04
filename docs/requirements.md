@@ -13,7 +13,7 @@
 > Functional requirements below remain the intended behavior; any mention of
 > Streamlit, `st.session_state`, or Plotly describes the original
 > implementation technology, not the shipped one. See `docs/deployment.md`
-> and `PROJECT_SUMMARY.md` for the current stack.
+> and `docs/history/project_summary.md` for the current stack.
 
 ---
 

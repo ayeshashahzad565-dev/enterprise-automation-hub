@@ -1,5 +1,6 @@
 # Enterprise Automation Hub (EAH)
 
+[![CI](https://github.com/ayeshashahzad565-dev/enterprise-automation-hub/actions/workflows/ci.yml/badge.svg)](https://github.com/ayeshashahzad565-dev/enterprise-automation-hub/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/downloads/release/python-3110/)
 [![Next.js](https://img.shields.io/badge/UI-Next.js-000000.svg)](https://nextjs.org/)
 [![Supabase](https://img.shields.io/badge/backend-Supabase-3ECF8E.svg)](https://supabase.com/)
@@ -207,7 +208,9 @@ cp frontend/.env.local.example frontend/.env.local
 | Variable | Description |
 |---|---|
 | `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Same Supabase project, browser-safe anon key only |
-| `NEXT_PUBLIC_API_BASE_URL` | The backend's base URL, defaults to `http://localhost:8000/api/v1` |
+| `NEXT_PUBLIC_API_BASE_URL` | The backend's base URL, defaults to `http://localhost:8000/api/v1` for local development |
+
+**Deploying the frontend separately from the backend** (e.g. frontend on Vercel, backend on a container host): set all three `NEXT_PUBLIC_*` variables above as environment variables in that platform's project settings — they are inlined into the JS bundle at `next build` time, so they must be present *before* the build runs, not just at runtime. `NEXT_PUBLIC_API_BASE_URL` must include the `/api/v1` suffix, e.g. `https://your-backend-host.example.com/api/v1`. Omitting it silently falls back to `http://localhost:8000/api/v1`, which only works when the browser itself can reach that address (i.e. never in a deployed environment).
 
 Apply the database schema before first run:
 

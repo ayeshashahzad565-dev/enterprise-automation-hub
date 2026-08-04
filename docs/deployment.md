@@ -6,7 +6,7 @@
 **Author:** Principal DevOps Architect
 **Deployment Model:** Containerized FastAPI backend + Next.js frontend + background worker, horizontally replicated behind a standard load balancer, backed by Supabase (Postgres/Auth/Storage) and an optional shared Redis (rate limiting, analytics caching, background email queue)
 
-> **Version 2.0 note:** This revision replaces every reference to the original Streamlit Presentation Layer, fully removed in favor of the FastAPI + Next.js split described throughout `PROJECT_SUMMARY.md`, and adds the production infrastructure layer introduced alongside it: Docker/Docker Compose, Redis, Prometheus/Grafana, and a GitHub Actions CD pipeline. See `docs/docker_deployment.md` for the concrete, command-level operational guide this document's Section 6 now points to; the sections below remain the architectural/policy-level deployment reference.
+> **Version 2.0 note:** This revision replaces every reference to the original Streamlit Presentation Layer, fully removed in favor of the FastAPI + Next.js split described throughout `docs/history/project_summary.md`, and adds the production infrastructure layer introduced alongside it: Docker/Docker Compose, Redis, Prometheus/Grafana, and a GitHub Actions CD pipeline. See `docs/docker_deployment.md` for the concrete, command-level operational guide this document's Section 6 now points to; the sections below remain the architectural/policy-level deployment reference.
 
 ---
 

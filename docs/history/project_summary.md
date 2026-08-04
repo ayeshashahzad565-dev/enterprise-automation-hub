@@ -1,6 +1,6 @@
 # Enterprise Automation Hub — Project Summary
 
-**Generated:** 2026-07-19, from direct inspection of the repository at `c:\Users\Y K C\Desktop\enterprise-automation-hub` (backend `app/`, frontend `frontend/`). Every claim below is sourced from actual code, migrations, config files, or test runs performed at generation time — not from assumption. Where something could not be confirmed, or is incomplete/missing, that is stated explicitly rather than guessed.
+**Generated:** 2026-07-19, from direct inspection of the repository (backend `app/`, frontend `frontend/`). Every claim below is sourced from actual code, migrations, config files, or test runs performed at generation time — not from assumption. Where something could not be confirmed, or is incomplete/missing, that is stated explicitly rather than guessed.
 
 ---
 
