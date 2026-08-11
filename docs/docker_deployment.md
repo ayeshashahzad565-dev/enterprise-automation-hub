@@ -56,6 +56,8 @@ Fill in real Supabase values in both files. `.env.example`'s "Frontend Docker bu
 
 Never commit a populated `.env` or `.env.local` — both are already covered by the standard `.gitignore` entries this repository has always had.
 
+**Using a managed Redis instead of the bundled `redis` Compose service** — on a host that doesn't run `docker-compose.production.yml` itself (e.g. a single-container PaaS like Back4App/Render/Railway), there's no `redis` service alongside `backend` to point `REDIS_URL` at. A managed provider such as [Upstash](https://upstash.com) works as a drop-in replacement: create a database, copy the connection string from its dashboard, and set it as `REDIS_URL` in that platform's environment variables. No code or Compose changes needed — `app.utils.redis_client.create_redis_client` builds the client via `redis.Redis.from_url`, which handles `rediss://` (TLS) the same as plain `redis://`. See the `REDIS_URL` entry in `.env.example` for the expected URL shape.
+
 ## 4. Local Development (Docker Compose)
 
 ```bash

@@ -8,7 +8,7 @@ export const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000/api/v1";
 
 if (process.env.NODE_ENV === "development" && !process.env.NEXT_PUBLIC_API_BASE_URL) {
-  // eslint-disable-next-line no-console -- deliberate, dev-only configuration warning
+  // Deliberate, dev-only configuration warning.
   console.warn(
     "[config] NEXT_PUBLIC_API_BASE_URL is not set — falling back to " +
       `"${API_BASE_URL}". Set it in frontend/.env.local (see ` +
