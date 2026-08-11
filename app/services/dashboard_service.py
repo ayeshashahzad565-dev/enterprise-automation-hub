@@ -12,7 +12,9 @@ produced by one of the four services above, not recomputed here.
 
 from __future__ import annotations
 
+import contextvars
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from app.auth.authentication import AuthenticatedIdentity
@@ -102,28 +104,88 @@ class DashboardService:
         Returns:
             A ``DashboardSummary`` DTO ready for presentation.
         """
-        recent_page = self._request_service.list_requests(identity, page=Page(number=1, size=5))
-        open_requests_result = self._request_service.list_requests(
-            identity, page=Page(number=1, size=1)
-        )
-
-        pending_approvals_count = 0
-        if identity.role in (UserRole.APPROVER, UserRole.ADMIN):
-            pending_page = self._approval_service.list_pending_approvals(
-                identity, page=Page(number=1, size=1)
+        # A separate size=1 call to read only .total_records would be a
+        # second, redundant round trip: PagedResult.total_records already
+        # reflects the full matching count regardless of the requested
+        # page size, so this one size=5 call alone answers both "the 5
+        # most recent requests" and "how many open requests total".
+        # These calls are independent — none consumes another's result —
+        # but each is a separate round trip to a remote Supabase region
+        # (~240ms). Issued sequentially, an approver/admin dashboard paid
+        # the *sum* of up to five of them; issued concurrently it costs
+        # roughly the slowest single one.
+        #
+        # Each submission gets its OWN contextvars.copy_context()
+        # snapshot, for two independent reasons:
+        #   1. Correctness. The RLS-scoped tenant database client that
+        #      app.api.dependencies.bind_tenant_database_client binds for
+        #      this request lives in a ContextVar. A bare pool.submit(fn)
+        #      starts its worker with a fresh, empty context, so every
+        #      repository would silently fall back to its default
+        #      service-role client — bypassing Row-Level Security and
+        #      returning rows this caller should not see. copy_context()
+        #      carries the binding across the thread hop. (It is captured
+        #      here, in the calling thread, where the binding is visible:
+        #      anyio already propagates the request's context into the
+        #      threadpool worker running this method.)
+        #   2. A single Context object cannot be entered by more than one
+        #      thread at a time — reusing one shared snapshot across all
+        #      five submissions raises "cannot enter context ... is
+        #      already entered". Hence one snapshot per submission.
+        is_approver_or_admin = identity.role in (UserRole.APPROVER, UserRole.ADMIN)
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            recent_future = pool.submit(
+                contextvars.copy_context().run,
+                self._request_service.list_requests,
+                identity,
+                page=Page(number=1, size=5),
             )
-            pending_approvals_count = pending_page.total_records
+            unread_future = pool.submit(
+                contextvars.copy_context().run,
+                self._notification_service.get_unread_count,
+                identity,
+            )
+            pending_future = (
+                pool.submit(
+                    contextvars.copy_context().run,
+                    self._approval_service.list_pending_approvals,
+                    identity,
+                    page=Page(number=1, size=1),
+                )
+                if is_approver_or_admin
+                else None
+            )
+            status_future = (
+                pool.submit(
+                    contextvars.copy_context().run,
+                    self._analytics_service.get_status_breakdown,
+                    identity,
+                )
+                if is_approver_or_admin
+                else None
+            )
+            throughput_future = (
+                pool.submit(
+                    contextvars.copy_context().run,
+                    self._analytics_service.get_approval_throughput,
+                    identity,
+                )
+                if is_approver_or_admin
+                else None
+            )
 
-        unread_count = self._notification_service.get_unread_count(identity)
-
-        status_breakdown: StatusBreakdown | None = None
-        approval_throughput: ApprovalThroughput | None = None
-        if identity.role in (UserRole.APPROVER, UserRole.ADMIN):
-            status_breakdown = self._analytics_service.get_status_breakdown(identity)
-            approval_throughput = self._analytics_service.get_approval_throughput(identity)
+            recent_page = recent_future.result()
+            unread_count = unread_future.result()
+            pending_approvals_count = pending_future.result().total_records if pending_future else 0
+            status_breakdown: StatusBreakdown | None = (
+                status_future.result() if status_future else None
+            )
+            approval_throughput: ApprovalThroughput | None = (
+                throughput_future.result() if throughput_future else None
+            )
 
         return DashboardSummary(
-            open_requests_count=open_requests_result.total_records,
+            open_requests_count=recent_page.total_records,
             pending_approvals_count=pending_approvals_count,
             unread_notifications_count=unread_count,
             recent_requests=recent_page.items,

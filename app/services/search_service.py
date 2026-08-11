@@ -39,10 +39,12 @@ not have. That gap is deliberate, not an oversight.
 
 from __future__ import annotations
 
+import contextvars
 import difflib
 import logging
 import uuid
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID
@@ -329,25 +331,57 @@ class GlobalSearchService:
         )
         candidate_limit = limit_per_type if limit_per_type is not None else MAX_PAGE_SIZE
 
-        results: list[SearchResultItem] = []
+        # Each per-entity search below is an independent round trip to a
+        # remote Supabase region (~240ms). Run sequentially, an unfiltered
+        # search paid the sum of all nine — multiple seconds, on an
+        # endpoint the Cmd/Ctrl+K command palette calls on every debounced
+        # keystroke. Run concurrently it costs roughly the slowest one.
+        #
+        # Each submission takes its OWN contextvars.copy_context()
+        # snapshot. That is a correctness requirement, not a tuning
+        # detail: the RLS-scoped tenant client bound by
+        # app.api.dependencies.bind_tenant_database_client lives in a
+        # ContextVar, and a bare pool.submit(fn) would start its worker
+        # with an empty context — every repository would silently fall
+        # back to the service-role client and search rows this caller is
+        # not entitled to see. One shared snapshot cannot be reused
+        # either: a Context may only be entered by one thread at a time.
+        #
+        # Ordering is unaffected — results are sorted by score below, not
+        # by the order the entity searches happen to finish in.
+        searches: list[Callable[[], list[SearchResultItem]]] = []
+        is_admin = identity.role is UserRole.ADMIN
+
+        def _plan(method: Callable[..., list[SearchResultItem]]) -> None:
+            searches.append(lambda: method(identity, query_text, candidate_limit))
+
         if "request" in types:
-            results.extend(self._search_requests(identity, query_text, candidate_limit))
+            _plan(self._search_requests)
         if "approval" in types:
-            results.extend(self._search_approvals(identity, query_text, candidate_limit))
+            _plan(self._search_approvals)
         if "workflow" in types:
-            results.extend(self._search_workflows(identity, query_text, candidate_limit))
-        if "user" in types and identity.role is UserRole.ADMIN:
-            results.extend(self._search_users(identity, query_text, candidate_limit))
-        if "department" in types and identity.role is UserRole.ADMIN:
-            results.extend(self._search_departments(identity, query_text, candidate_limit))
+            _plan(self._search_workflows)
+        if "user" in types and is_admin:
+            _plan(self._search_users)
+        if "department" in types and is_admin:
+            _plan(self._search_departments)
         if "comment" in types:
-            results.extend(self._search_comments(identity, query_text, candidate_limit))
+            _plan(self._search_comments)
         if "audit_entry" in types:
-            results.extend(self._search_audit_entries(identity, query_text, candidate_limit))
+            _plan(self._search_audit_entries)
         if "notification" in types:
-            results.extend(self._search_notifications(identity, query_text, candidate_limit))
+            _plan(self._search_notifications)
         if "attachment" in types:
-            results.extend(self._search_attachments(identity, query_text, candidate_limit))
+            _plan(self._search_attachments)
+
+        results: list[SearchResultItem] = []
+        if searches:
+            with ThreadPoolExecutor(max_workers=len(searches)) as pool:
+                futures = [
+                    pool.submit(contextvars.copy_context().run, search) for search in searches
+                ]
+                for future in futures:
+                    results.extend(future.result())
 
         results.sort(key=lambda item: (item.score, item.created_at), reverse=True)
 

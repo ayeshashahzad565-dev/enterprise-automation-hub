@@ -14,7 +14,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.database.client import SupabaseClientFactory, SupabaseConnectionSettings
+from app.database.client import (
+    SupabaseClientFactory,
+    SupabaseConnectionSettings,
+    reset_user_client_cache,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -25,6 +29,15 @@ def _settings() -> SupabaseConnectionSettings:
         anon_key="anon-key",
         service_role_key="service-role-key",
     )
+
+
+@pytest.fixture(autouse=True)
+def _clear_user_client_cache() -> None:
+    """``create_user_scoped_client`` memoizes per access token in
+    module-level state. Without clearing it between tests, one test's
+    cached client would satisfy another's call and silently skip the
+    construction these tests are asserting about."""
+    reset_user_client_cache()
 
 
 class TestCreateUserScopedClient:
@@ -44,15 +57,29 @@ class TestCreateUserScopedClient:
             SupabaseClientFactory.create_user_scoped_client(_settings(), "a-callers-own-token")
         raw_client.postgrest.auth.assert_called_once_with("a-callers-own-token")
 
-    def test_each_call_constructs_a_fresh_client_rather_than_reusing_one(self) -> None:
-        """Two callers with different tokens must never share one
-        underlying client instance — ``postgrest.auth(...)`` mutates
-        headers in place, so reuse would let one request's identity leak
-        into another's."""
+    def test_different_tokens_never_share_a_client(self) -> None:
+        """The security-critical property of the per-token cache: two
+        callers with different tokens must never share one underlying
+        client instance — ``postgrest.auth(...)`` mutates headers in
+        place, so reuse across tokens would let one request's identity
+        leak into another's."""
         with patch("app.database.client.create_client", side_effect=[MagicMock(), MagicMock()]):
             first = SupabaseClientFactory.create_user_scoped_client(_settings(), "token-a")
             second = SupabaseClientFactory.create_user_scoped_client(_settings(), "token-b")
         assert first is not second
+
+    def test_same_token_reuses_the_cached_client(self) -> None:
+        """The performance property: constructing one of these is slow
+        (~1s), and it happens on every authenticated request, so a repeat
+        call with the identical token must be served from cache rather
+        than rebuilding."""
+        with patch(
+            "app.database.client.create_client", return_value=MagicMock()
+        ) as create_client:
+            first = SupabaseClientFactory.create_user_scoped_client(_settings(), "same-token")
+            second = SupabaseClientFactory.create_user_scoped_client(_settings(), "same-token")
+        assert first is second
+        create_client.assert_called_once()
 
     def test_wraps_construction_failure_in_a_typed_error(self) -> None:
         from app.database.exceptions import DatabaseConnectionError

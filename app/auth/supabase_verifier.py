@@ -11,9 +11,15 @@ This is deliberately a different, narrower capability than
 callback-exchange, and password-management *flows* a Streamlit login
 form drives, always starting from a fresh Supabase Auth response.
 This module instead validates a bearer token an HTTP client already
-holds — the one thing every authenticated REST request needs checked,
-fresh, on every call (API-ADD Section 5.3, 5.5), since a stateless API
-has no server-side session to consult instead. Neither class depends on
+holds — the one thing every authenticated REST request needs checked
+(API-ADD Section 5.3, 5.5), since a stateless API has no server-side
+session to consult instead. The actual Supabase Auth call plus profile/
+company lookups (``_resolve_claims_uncached``) is the dominant source of
+per-request latency in this system — three sequential network round
+trips before any business query runs — so ``resolve_claims`` fronts it
+with a short-TTL cache (``_CLAIMS_CACHE_TTL_SECONDS``) keyed by the raw
+token, trading a small, bounded revocation-lag window for skipping that
+cost on every repeated request within it. Neither class depends on
 the other; both happen to construct a fresh, unauthenticated Supabase
 client per call, for the same isolation reason
 ``SupabaseAuthGateway``'s own docstring already gives (avoiding any
@@ -42,10 +48,23 @@ from app.database.client import SupabaseClientFactory, SupabaseConnectionSetting
 from app.database.exceptions import RecordNotFoundError
 from app.database.repositories.company_repository import CompanyRepository
 from app.database.repositories.user_repository import ProfileRepository
+from app.utils.cache import ResponseCache, TTLCache
 
 __all__ = ["SupabaseTokenVerifier"]
 
 logger = logging.getLogger(__name__)
+
+#: Every authenticated request re-runs this verifier from scratch — a real
+#: Supabase Auth call plus two Postgres lookups — with no caching, so that
+#: a deactivated account or suspended/deleted company is blocked on its
+#: very next request rather than at next login. That is a real, deliberate
+#: cost: it was the dominant source of per-request latency across the
+#: whole app (three sequential network round trips before any actual
+#: business query runs). This short a cache absorbs the common case — the
+#: same bearer token making several requests in quick succession while a
+#: user browses a single page — while bounding revocation lag to this
+#: window rather than eliminating it outright.
+_CLAIMS_CACHE_TTL_SECONDS = 15.0
 
 
 class SupabaseTokenVerifier:
@@ -63,6 +82,7 @@ class SupabaseTokenVerifier:
         supabase_settings: SupabaseConnectionSettings,
         profile_repo: ProfileRepository,
         company_repo: CompanyRepository,
+        response_cache: ResponseCache | None = None,
     ) -> None:
         """Initialize the verifier.
 
@@ -77,14 +97,30 @@ class SupabaseTokenVerifier:
                 active on every request — per the Platform
                 Administration module, suspending or deleting a company
                 must take effect immediately, not just at next login.
+            response_cache: Cache backend for resolved claims, keyed by
+                the raw bearer token. Defaults to a private ``TTLCache``
+                when not supplied (matching ``AnalyticsEngine``'s own
+                ``response_cache or TTLCache(...)`` convention) — pass a
+                shared ``RedisCache`` in a multi-instance deployment so
+                every instance benefits from the same cached claims.
         """
         self._supabase_settings = supabase_settings
         self._profile_repo = profile_repo
         self._company_repo = company_repo
+        self._response_cache = response_cache or TTLCache(ttl_seconds=_CLAIMS_CACHE_TTL_SECONDS)
         self._logger = logging.getLogger(f"{__name__}.SupabaseTokenVerifier")
 
     def resolve_claims(self, token: str) -> Mapping[str, Any]:
         """Validate a bearer token against Supabase and return its claims.
+
+        Served from this verifier's short-TTL cache when the identical
+        token was already resolved within the last
+        ``_CLAIMS_CACHE_TTL_SECONDS`` — see that constant's own comment
+        for why. A failed verification (an invalid token, a revoked
+        account/company) is never cached: ``get_or_compute`` only stores
+        a successful return value, since the callable below raises
+        rather than returning one on failure, so a caller retrying with a
+        corrected/refreshed token is never held back by a stale rejection.
 
         Args:
             token: The raw bearer token, as extracted by
@@ -100,6 +136,21 @@ class SupabaseTokenVerifier:
             discarded within the same request — there is no later point
             in a stateless request for a separately-tracked expiry to
             matter.
+
+        Raises:
+            InvalidTokenError: If Supabase rejects the token, or no
+                ``profiles`` row exists for its subject.
+        """
+        return self._response_cache.get_or_compute(token, lambda: self._resolve_claims_uncached(token))
+
+    def _resolve_claims_uncached(self, token: str) -> Mapping[str, Any]:
+        """The real Supabase Auth call plus profile/company lookups, uncached.
+
+        Args:
+            token: The raw bearer token.
+
+        Returns:
+            The resolved claims mapping — see ``resolve_claims``.
 
         Raises:
             InvalidTokenError: If Supabase rejects the token, or no
@@ -141,20 +192,20 @@ class SupabaseTokenVerifier:
 
         # Per the deletion-strategy design (docs/database_schema.md
         # Section 3.10, 0020_profile_lifecycle): a deactivated or erased
-        # profile must be blocked immediately, on this very request, not
-        # just at next login — this verifier is re-run on every
-        # authenticated request with no server-side session cache, the
-        # same reasoning the company check just below already relies on.
+        # profile must be blocked promptly, not just at next login — this
+        # verifier is re-run on every cache miss (bounded by
+        # _CLAIMS_CACHE_TTL_SECONDS, not just at next login), the same
+        # reasoning the company check just below already relies on.
         if profile.deleted_at is not None:
             raise AccountAccessRevokedError("erased")
         if not profile.is_active:
             raise AccountAccessRevokedError("deactivated")
 
         # Per the Platform Administration module: a suspended or deleted
-        # company blocks every one of its users immediately, on their
-        # very next request — this check runs here (not just at login)
-        # because this verifier itself is re-run on every authenticated
-        # request, with no server-side session cache to go stale.
+        # company blocks every one of its users promptly — this check
+        # runs here (not just at login) because this verifier itself is
+        # re-run on every cache miss, bounded by _CLAIMS_CACHE_TTL_SECONDS
+        # rather than going stale for an entire session.
         company = self._company_repo.get_by_id(profile.company_id)
         if company.deleted_at is not None:
             raise CompanyAccessRevokedError("deleted")

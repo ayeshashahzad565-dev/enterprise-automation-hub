@@ -850,8 +850,22 @@ def build_application_resources(settings: AppSettings | None = None) -> Applicat
 
     # --- Authentication (stateless HTTP entry points only; see module
     # docstring for why SupabaseAuthGateway is not constructed here) -----
+    # response_cache here is the single biggest lever on per-request
+    # latency in this system: without it, every authenticated request pays
+    # a real Supabase Auth call plus two Postgres lookups (see
+    # SupabaseTokenVerifier's module docstring) before any business query
+    # even runs. Same RedisCache-when-configured/TTLCache-fallback
+    # convention as the Analytics Layer above, shared across instances via
+    # Redis when configured.
     token_verifier = SupabaseTokenVerifier(
-        supabase_settings=settings.supabase, profile_repo=profile_repo, company_repo=company_repo
+        supabase_settings=settings.supabase,
+        profile_repo=profile_repo,
+        company_repo=company_repo,
+        response_cache=(
+            RedisCache(client=redis_client, namespace="auth_claims", ttl_seconds=15.0)
+            if redis_client is not None
+            else None
+        ),
     )
 
     # --- Scheduler ----------------------------------------------------

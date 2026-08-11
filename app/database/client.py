@@ -34,6 +34,8 @@ It defines:
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -42,6 +44,53 @@ from supabase import Client, create_client
 from app.database.exceptions import DatabaseConnectionError
 
 logger = logging.getLogger(__name__)
+
+#: How long a user-scoped client is reused before being rebuilt, and the
+#: hard cap on how many are retained at once. Constructing one of these
+#: measured at roughly 1 second on this deployment — and
+#: ``app.api.dependencies.bind_tenant_database_client`` builds one on
+#: *every* authenticated request, making it by far the largest single
+#: contributor to per-request latency (the database query it then runs
+#: costs ~240ms). See ``SupabaseClientFactory.create_user_scoped_client``
+#: for why caching these by token is safe.
+_USER_CLIENT_CACHE_TTL_SECONDS = 300.0
+_USER_CLIENT_CACHE_MAX_ENTRIES = 256
+
+_user_client_cache: dict[str, tuple[float, SupabaseDatabaseClient]] = {}
+_user_client_cache_lock = threading.Lock()
+
+
+def reset_user_client_cache() -> None:
+    """Drop every cached user-scoped client.
+
+    Exists for tests: the cache below is module-level process state, so
+    without an explicit reset one test's cached client would satisfy a
+    later test's call and make assertions about client *construction*
+    order-dependent. Not used by application code, which relies on the
+    TTL and size cap instead.
+    """
+    with _user_client_cache_lock:
+        _user_client_cache.clear()
+
+
+def _prune_user_client_cache(now: float) -> None:
+    """Drop expired entries, then oldest-first if still over capacity.
+
+    Callers must already hold ``_user_client_cache_lock``. The size cap
+    matters because access tokens rotate: without it, a long-lived
+    process would accumulate one dead entry per refreshed token.
+
+    Args:
+        now: The current ``time.monotonic()`` reading.
+    """
+    expired = [key for key, (expires_at, _) in _user_client_cache.items() if expires_at <= now]
+    for key in expired:
+        del _user_client_cache[key]
+
+    overflow = len(_user_client_cache) - _USER_CLIENT_CACHE_MAX_ENTRIES
+    if overflow > 0:
+        for key in sorted(_user_client_cache, key=lambda k: _user_client_cache[k][0])[:overflow]:
+            del _user_client_cache[key]
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,12 +345,33 @@ class SupabaseClientFactory:
         (``client.postgrest.auth(access_token)``), which makes every
         subsequent request use that token's ``Authorization`` header —
         Postgres then evaluates policies with ``auth.uid()`` resolving to
-        this caller, not the anon role. A fresh client is constructed on
-        every call rather than mutating a shared instance, since the
-        underlying ``postgrest.auth(...)`` call mutates the client's
-        headers in place — reusing one instance across concurrent callers
-        with different tokens would let one request's identity leak into
-        another's.
+        this caller, not the anon role.
+
+        **Cached per access token**, for up to
+        ``_USER_CLIENT_CACHE_TTL_SECONDS``. Constructing one of these
+        measured at ~1s on this deployment, and this is called on every
+        authenticated request, so building a fresh one each time was the
+        single largest source of per-request latency.
+
+        Caching preserves the isolation guarantee that previously
+        motivated building a fresh client every call. The hazard there is
+        specific: ``postgrest.auth(...)`` mutates the client's headers in
+        place, so sharing *one* instance between callers holding
+        *different* tokens would let one request's identity leak into
+        another's. Keying the cache on the access token itself means a
+        cached client is only ever handed back for the very same token it
+        was built for — two different callers never share an instance, and
+        a single caller's concurrent requests share an instance whose
+        headers are identical anyway. (Concurrent reuse itself is already
+        this codebase's norm: the service-role client is constructed once
+        at startup and shared process-wide across every request.)
+
+        Caching cannot widen what a token is allowed to do: the token is
+        still verified on its own schedule by
+        ``SupabaseTokenVerifier``, and Postgres re-evaluates RLS against
+        the token on every query, so an expired or revoked token attached
+        to a cached client is rejected exactly as it would be on a freshly
+        built one.
 
         Args:
             settings: The target Supabase project's connection settings.
@@ -317,6 +387,12 @@ class SupabaseClientFactory:
             DatabaseConnectionError: If the underlying client cannot be
                 constructed.
         """
+        now = time.monotonic()
+        with _user_client_cache_lock:
+            cached = _user_client_cache.get(access_token)
+            if cached is not None and cached[0] > now:
+                return cached[1]
+
         try:
             raw_client = create_client(settings.url, settings.anon_key)
             raw_client.postgrest.auth(access_token)
@@ -326,7 +402,12 @@ class SupabaseClientFactory:
                 "Failed to construct a Supabase client scoped to the caller's own token.",
                 details={"url": settings.url},
             ) from exc
-        return SupabaseDatabaseClient(raw_client, is_service_role=False)
+
+        client = SupabaseDatabaseClient(raw_client, is_service_role=False)
+        with _user_client_cache_lock:
+            _prune_user_client_cache(now)
+            _user_client_cache[access_token] = (now + _USER_CLIENT_CACHE_TTL_SECONDS, client)
+        return client
 
     @staticmethod
     def create_service_role_client(settings: SupabaseConnectionSettings) -> SupabaseDatabaseClient:
