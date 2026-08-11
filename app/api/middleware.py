@@ -205,19 +205,57 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         return response
 
 
+def _templated_path(request: Request) -> str:
+    """Return this request's full, templated path for use as a metric label.
+
+    Args:
+        request: The request, after routing has run (so ``scope`` carries
+            ``route``/``path_params`` for anything that matched).
+
+    Returns:
+        The request path with every matched path-param value replaced by
+        its ``{name}`` placeholder — e.g.
+        ``/api/v1/requests/{request_id}`` — or ``"unmatched"`` when no
+        route matched, since a raw unmatched path is attacker-controllable
+        and would blow up label cardinality.
+    """
+    if request.scope.get("route") is None:
+        return "unmatched"
+
+    raw_path = request.url.path
+    params = request.scope.get("path_params") or {}
+    if not params:
+        return raw_path
+
+    placeholder_for_value = {str(value): name for name, value in params.items()}
+    return "/".join(
+        f"{{{placeholder_for_value[segment]}}}" if segment in placeholder_for_value else segment
+        for segment in raw_path.split("/")
+    )
+
+
 class MetricsMiddleware(BaseHTTPMiddleware):
     """Record Prometheus request-count and latency metrics for every request.
 
-    Reads the *templated* route path (e.g. ``/requests/{request_id}``,
-    not the literal ``/requests/3fa8...``) from ``request.scope["route"]``
-    after ``call_next`` returns — by then, FastAPI's routing has already
-    matched (or failed to match) the request, populating that scope key
-    for any route that matched. Deliberately never labels a metric with
-    the raw request path: an unbounded label value (one time series per
+    Labels each metric with the *templated* request path (e.g.
+    ``/api/v1/requests/{request_id}``, not the literal
+    ``/api/v1/requests/3fa8...``). Deliberately never labels a metric
+    with the raw path: an unbounded label value (one time series per
     distinct resource id ever requested) is exactly the "cardinality
     explosion" Prometheus's own documentation warns against, so an
     unmatched request (a genuine 404, prior to routing) is labeled with a
-    fixed ``"unmatched"`` placeholder instead of its raw path.
+    fixed ``"unmatched"`` placeholder instead.
+
+    The template is rebuilt from ``request.url.path`` plus
+    ``scope["path_params"]`` rather than read off ``scope["route"].path``
+    directly. Those are not the same string: a route registered on a
+    router that was included under a prefix reports only its own
+    router-relative path there (``/health``, not ``/api/v1/health``), so
+    using it would silently merge same-suffix routes from different
+    routers into one time series and drop the prefix from every metric.
+    Substituting each matched path-param value back into the real request
+    path yields the full, prefixed template while keeping cardinality
+    bounded exactly as before.
     """
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
@@ -234,8 +272,7 @@ class MetricsMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         duration_seconds = time.perf_counter() - started
 
-        route = request.scope.get("route")
-        path_template = getattr(route, "path", None) or "unmatched"
+        path_template = _templated_path(request)
 
         REQUEST_LATENCY_SECONDS.labels(method=request.method, path_template=path_template).observe(
             duration_seconds
