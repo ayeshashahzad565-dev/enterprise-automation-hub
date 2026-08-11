@@ -59,8 +59,7 @@ export function StageInspectorPanel({
       if (result.success) onChange(result.data);
     });
     return () => subscription.unsubscribe();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [watch]);
+  }, [watch, onChange]);
 
   if (!stage) {
     return (
@@ -93,7 +92,7 @@ export function StageInspectorPanel({
       <div className="space-y-2">
         <Label htmlFor="stage-strategy">Assignment</Label>
         <Select
-          value={strategy}
+          value={strategy ?? ""}
           onValueChange={(value) =>
             setValue("assignment_strategy", value as StageFormValues["assignment_strategy"], {
               shouldValidate: true,

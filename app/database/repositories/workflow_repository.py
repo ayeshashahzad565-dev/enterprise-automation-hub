@@ -372,6 +372,38 @@ class WorkflowDefinitionRepository(BaseRepository[WorkflowDefinitionRecord]):
             version_column="row_version",
         )
 
+    def delete_inactive_definition(self, definition_id: UUID, *, company_id: UUID) -> None:
+        """Hard-delete a workflow definition that has not been activated.
+
+        The ``is_active = False`` predicate is applied in the delete
+        itself (not checked as a separate read-then-delete step) as a
+        defense-in-depth backstop to the Application Layer's own
+        ``WorkflowEngine.validate_definition_edit`` check — an active
+        definition can never be removed by this method even if that
+        check were somehow bypassed. ``company_id`` is scoped the same
+        way, so one company can never delete another's definition even
+        if it somehow learns the id.
+
+        Args:
+            definition_id: The definition's ``id``.
+            company_id: The company (tenant) the definition must belong
+                to.
+
+        Raises:
+            RecordNotFoundError: If no inactive definition with this id
+                exists for this company.
+        """
+        response = self._execute(
+            self._query()
+            .delete()
+            .eq("id", str(definition_id))
+            .eq("company_id", str(company_id))
+            .eq("is_active", False),
+            operation="delete_inactive_definition",
+        )
+        if not self._rows(response):
+            raise RecordNotFoundError(self.table_name, definition_id)
+
     def activate_definition(
         self,
         definition_id: UUID,

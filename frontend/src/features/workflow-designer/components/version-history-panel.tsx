@@ -65,8 +65,13 @@ export function VersionHistoryPanel({
           <TabsTrigger value="draft">Draft ({buckets.draft.length})</TabsTrigger>
           <TabsTrigger value="active">Active ({buckets.active.length})</TabsTrigger>
           <TabsTrigger value="archived">
+            {/* TabsTrigger already renders a <button> — TooltipTrigger
+                defaults to one too, and HTML forbids nesting <button>s
+                (a real hydration error, not just a lint nit). render={<span />}
+                keeps the tooltip's hover/focus behavior while avoiding the
+                nested-button DOM. */}
             <Tooltip>
-              <TooltipTrigger>Archived ({buckets.archived.length})</TooltipTrigger>
+              <TooltipTrigger render={<span />}>Archived ({buckets.archived.length})</TooltipTrigger>
               <TooltipContent>Inferred from version order — not a stored backend status.</TooltipContent>
             </Tooltip>
           </TabsTrigger>

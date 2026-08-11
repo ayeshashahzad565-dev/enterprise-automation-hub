@@ -1,12 +1,13 @@
 "use client";
 
-import { Copy, Redo2, Undo2 } from "lucide-react";
+import { Copy, Redo2, Trash2, Undo2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 
 export function WorkflowToolbar({
   isDraft,
   isSaving,
+  isDeleting,
   canUndo,
   canRedo,
   onUndo,
@@ -14,9 +15,11 @@ export function WorkflowToolbar({
   onSaveDraft,
   onPublish,
   onDuplicate,
+  onDelete,
 }: {
   isDraft: boolean;
   isSaving: boolean;
+  isDeleting: boolean;
   canUndo: boolean;
   canRedo: boolean;
   onUndo: () => void;
@@ -24,6 +27,7 @@ export function WorkflowToolbar({
   onSaveDraft: () => void;
   onPublish: () => void;
   onDuplicate: () => void;
+  onDelete: () => void;
 }) {
   return (
     <div className="flex flex-wrap items-center gap-2">
@@ -36,6 +40,11 @@ export function WorkflowToolbar({
       <Button variant="outline" size="sm" onClick={onDuplicate}>
         <Copy className="size-4" /> Duplicate
       </Button>
+      {isDraft && (
+        <Button variant="outline" size="sm" disabled={isDeleting} onClick={onDelete}>
+          <Trash2 className="size-4" /> Delete draft
+        </Button>
+      )}
       <div className="ml-auto flex items-center gap-2">
         {isDraft && (
           <Button variant="outline" size="sm" disabled={isSaving} onClick={onSaveDraft}>

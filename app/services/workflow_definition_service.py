@@ -370,6 +370,55 @@ class WorkflowDefinitionService:
         return map_workflow_definition_record_to_domain(updated)
 
     @log_calls()
+    def delete_draft(self, identity: AuthenticatedIdentity, definition_id: UUID) -> None:
+        """Delete a workflow definition that has not yet been activated.
+
+        Args:
+            identity: The authenticated administrator deleting this
+                version.
+            definition_id: The id of the definition to delete.
+
+        Raises:
+            PermissionDeniedError: If ``identity`` is not an
+                administrator.
+            NotFoundError: If no definition with ``definition_id`` exists.
+            WorkflowError: If the target definition is already active —
+                reuses the same rule ``update_draft`` enforces, since
+                deleting an active definition would be exactly as
+                destructive as silently editing one in place.
+        """
+        try:
+            authorize_workflow_definition_management(identity)
+        except Exception as exc:  # noqa: BLE001
+            raise translate_auth_error(exc) from exc
+
+        try:
+            existing = self._workflow_definition_repo.get_by_id_for_company(
+                definition_id, company_id=identity.company_id
+            )
+        except RecordNotFoundError as exc:
+            raise translate_database_error(exc) from exc
+
+        existing_domain = map_workflow_definition_record_to_domain(existing)
+        try:
+            self._workflow_engine.validate_definition_edit(existing_domain)
+        except EngineWorkflowError as exc:
+            raise translate_workflow_error(exc) from exc
+
+        try:
+            self._workflow_definition_repo.delete_inactive_definition(
+                definition_id, company_id=identity.company_id
+            )
+        except DatabaseError as exc:
+            raise translate_database_error(exc) from exc
+
+        self._logger.info(
+            "Deleted draft workflow definition %s",
+            definition_id,
+            extra={"definition_id": str(definition_id)},
+        )
+
+    @log_calls()
     def activate_version(
         self, identity: AuthenticatedIdentity, definition_id: UUID
     ) -> WorkflowDefinition:

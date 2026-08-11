@@ -23,7 +23,7 @@ from __future__ import annotations
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Query, Request, Response
 
 from app.api.dependencies import get_current_identity, get_workflow_definition_service
 from app.api.schemas.workflow_definitions import (
@@ -112,6 +112,19 @@ def update_workflow_definition_draft(
     )
     out = WorkflowDefinitionOut.model_validate(updated)
     return build_success_response(serialize(out), request_id=_request_id_of(request))
+
+
+@router.delete("/workflow-definitions/{definition_id}", status_code=204)
+def delete_workflow_definition_draft(
+    definition_id: UUID,
+    identity: AuthenticatedIdentity = Depends(get_current_identity),
+    service: WorkflowDefinitionService = Depends(get_workflow_definition_service),
+) -> Response:
+    """Delete a not-yet-activated workflow definition. Admin only.
+    See ``WorkflowDefinitionService.delete_draft``.
+    """
+    service.delete_draft(identity, definition_id)
+    return Response(status_code=204)
 
 
 @router.post("/workflow-definitions/{definition_id}/activate")

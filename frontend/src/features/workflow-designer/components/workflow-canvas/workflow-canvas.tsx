@@ -3,7 +3,6 @@
 import {
   Background,
   Controls,
-  MiniMap,
   ReactFlow,
   ReactFlowProvider,
   applyNodeChanges,
@@ -12,7 +11,8 @@ import {
   type NodeTypes,
   type OnNodeDrag,
 } from "@xyflow/react";
-import "@xyflow/react/dist/style.css";
+// React Flow's base stylesheet is imported from app/layout.tsx instead of
+// here — see that import's comment for why.
 import { useEffect, useMemo, useState } from "react";
 
 import {
@@ -147,12 +147,26 @@ export function WorkflowCanvas({
           onNodeDragStop={handleNodeDragStop}
           nodesConnectable={false}
           elementsSelectable
-          fitView
+          // `fitView` (the boolean prop) only runs once, at mount — racing
+          // react-resizable-panels' own async pixel-size calculation for
+          // this canvas's containing panel. When it loses that race, React
+          // Flow computes its initial zoom/pan from a still-0-sized
+          // container (logging its own "parent container needs a width
+          // and a height" warning) and never recalculates, leaving the
+          // view zoomed/panned to somewhere nonsensical. Calling
+          // instance.fitView() from onInit, deferred one frame via
+          // requestAnimationFrame, runs it after the browser has actually
+          // finished laying out the page instead.
+          //
+          // padding: 0.3 leaves a real margin around the fitted diagram —
+          // without it a short chain (e.g. Start -> two stages -> End) fits
+          // so tightly that the outermost nodes sit flush against the
+          // canvas edge, colliding with the zoom Controls overlay.
+          onInit={(instance) => requestAnimationFrame(() => instance.fitView({ padding: 0.3 }))}
           proOptions={{ hideAttribution: true }}
         >
           <Background gap={24} />
           <Controls showInteractive={false} />
-          <MiniMap pannable zoomable className="!bg-card" />
         </ReactFlow>
       </div>
     </ReactFlowProvider>

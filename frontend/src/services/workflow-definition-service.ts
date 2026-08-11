@@ -31,4 +31,5 @@ export const workflowDefinitionService = {
     apiClient.patch<WorkflowDefinition>(`/workflow-definitions/${id}`, body),
   activate: (id: string) =>
     apiClient.post<WorkflowDefinition>(`/workflow-definitions/${id}/activate`),
+  deleteDraft: (id: string) => apiClient.delete<void>(`/workflow-definitions/${id}`),
 };

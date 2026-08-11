@@ -8,6 +8,12 @@ import { QueryProvider } from "@/providers/query-provider";
 import { ThemeProvider } from "@/providers/theme-provider";
 
 import "./globals.css";
+// React Flow's base stylesheet. Imported here rather than from
+// workflow-canvas.tsx because that component is loaded via
+// next/dynamic(..., { ssr: false }); keeping global (non-module) CSS in the
+// root layout means it is part of the initial stylesheet instead of
+// arriving with the lazily-loaded chunk.
+import "@xyflow/react/dist/style.css";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
