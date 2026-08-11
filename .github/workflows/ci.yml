@@ -76,7 +76,10 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          # 22, not 20: @supabase/* declares engines.node >= 22, so `npm ci`
+          # fails outright on 20. Keep in step with frontend/Dockerfile and
+          # the prerequisites in README.md.
+          node-version: "22"
           cache: "npm"
           cache-dependency-path: frontend/package-lock.json
 

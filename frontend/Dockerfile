@@ -18,19 +18,22 @@
 # only satisfy the module-load-time validation in src/lib/supabase/env.ts
 # (matching .github/workflows/ci.yml's identical CI-placeholder pattern).
 #
-# All three `FROM node:20-slim` stages are pinned to a digest (not the
-# floating `20-slim` tag) for reproducible builds. Pinned 2026-07-29; bump
-# deliberately (`docker pull node:20-slim` + `docker inspect
-# --format='{{index .RepoDigests 0}}' node:20-slim`) to pick up new
+# All three `FROM node:22-slim` stages are pinned to a digest (not the
+# floating `22-slim` tag) for reproducible builds. Pinned 2026-08-12; bump
+# deliberately (`docker pull node:22-slim` + `docker inspect
+# --format='{{index .RepoDigests 0}}' node:22-slim`) to pick up new
 # base-image security patches — update all three stages together.
+#
+# 22, not 20: @supabase/* declares engines.node >= 22, so `npm ci` in the
+# deps stage fails on 20. Keep in step with .github/workflows/*.yml.
 
-FROM node:20-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0 AS deps
+FROM node:22-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 
 
-FROM node:20-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0 AS builder
+FROM node:22-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
@@ -44,7 +47,7 @@ ENV NEXT_PUBLIC_SUPABASE_URL=${NEXT_PUBLIC_SUPABASE_URL} \
 RUN npm run build
 
 
-FROM node:20-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0 AS runner
+FROM node:22-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS runner
 WORKDIR /app
 
 ENV NODE_ENV=production \

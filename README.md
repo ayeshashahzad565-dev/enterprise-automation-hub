@@ -108,7 +108,7 @@ Full rationale for every layer, component, and design decision is documented in 
 
 | Layer | Technology |
 |---|---|
-| Language / Runtime | Python 3.11+ (backend), Node.js 20+ (frontend) |
+| Language / Runtime | Python 3.11+ (backend), Node.js 22+ (frontend) |
 | API | FastAPI |
 | UI | Next.js (App Router) / React, TanStack Query, Tailwind CSS |
 | Data Validation | Pydantic v2 |
@@ -160,7 +160,7 @@ scripts/           # Database bootstrap, reset, and demo-data seed scripts
 
 ## Installation
 
-**Prerequisites:** Python 3.11+, Node.js 20+, a Supabase project (see [Environment Setup](#environment-setup)), and `pip`/`npm`.
+**Prerequisites:** Python 3.11+, Node.js 22+, a Supabase project (see [Environment Setup](#environment-setup)), and `pip`/`npm`.
 
 ```bash
 # Clone the repository
