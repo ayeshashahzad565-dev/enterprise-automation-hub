@@ -216,6 +216,14 @@ export function WorkflowNetwork({ className }: { className?: string }) {
       if (!canvas || !container) return;
       const width = container.clientWidth;
       const height = container.clientHeight;
+      // A remount (e.g. React Fast Refresh) can run this effect before the
+      // browser has finished laying out `container` — sizing the canvas to
+      // 0x0 in that instant, with nothing to trigger a recompute afterward
+      // (only `window`'s resize event is otherwise observed, which never
+      // fires for a container-only layout change). Skip sizing to a
+      // zero/near-zero box; the ResizeObserver below re-invokes this once
+      // real dimensions are available.
+      if (width < 2 || height < 2) return;
       dpr = Math.min(window.devicePixelRatio || 1, 2);
       canvas.width = Math.round(width * dpr);
       canvas.height = Math.round(height * dpr);
@@ -225,15 +233,27 @@ export function WorkflowNetwork({ className }: { className?: string }) {
       packets = [];
       ripples = [];
       nextSpawnAt = 0;
+      // In reduced-motion mode nothing else ever redraws (the animation
+      // loop below never starts) — so if the very first `resize()` call
+      // hit the 0x0 guard above and skipped painting, a later resize (the
+      // ResizeObserver firing once real dimensions exist) must repaint the
+      // static frame itself, or the panel stays blank permanently.
+      if (reduceMotion) drawStaticFrame();
     }
     resize();
 
     let resizeTimer: ReturnType<typeof setTimeout> | null = null;
-    const handleResize = () => {
+    const scheduleResize = () => {
       if (resizeTimer) clearTimeout(resizeTimer);
       resizeTimer = setTimeout(resize, 150);
     };
-    window.addEventListener("resize", handleResize);
+    window.addEventListener("resize", scheduleResize);
+    // Catches container-only size changes (this panel's own layout
+    // shifting) that never fire a window resize event, and — since
+    // ResizeObserver's callback fires once immediately on observe — also
+    // covers the 0x0-at-mount race the guard above skips.
+    const resizeObserver = new ResizeObserver(scheduleResize);
+    resizeObserver.observe(container);
 
     const mouse = { x: null as number | null, y: null as number | null };
 
@@ -299,7 +319,8 @@ export function WorkflowNetwork({ className }: { className?: string }) {
     if (reduceMotion) {
       drawStaticFrame();
       return () => {
-        window.removeEventListener("resize", handleResize);
+        window.removeEventListener("resize", scheduleResize);
+        resizeObserver.disconnect();
         container.removeEventListener("pointermove", handlePointerMove);
         container.removeEventListener("pointerleave", handlePointerLeave);
         document.removeEventListener("visibilitychange", handleVisibility);
@@ -497,7 +518,8 @@ export function WorkflowNetwork({ className }: { className?: string }) {
 
     return () => {
       cancelAnimationFrame(rafId);
-      window.removeEventListener("resize", handleResize);
+      window.removeEventListener("resize", scheduleResize);
+      resizeObserver.disconnect();
       container.removeEventListener("pointermove", handlePointerMove);
       container.removeEventListener("pointerleave", handlePointerLeave);
       document.removeEventListener("visibilitychange", handleVisibility);

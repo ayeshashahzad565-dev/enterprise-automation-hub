@@ -10,7 +10,7 @@ export default function LoginPage() {
           reads as premium against real darkness; the previous solid
           --primary (bright indigo) fill left the "dark charcoal nodes, soft
           indigo glow" contrast nowhere to actually show up. */}
-      <div className="relative hidden w-1/2 flex-col justify-between overflow-hidden bg-[#08090d] p-12 text-slate-100 md:flex">
+      <div className="relative hidden w-1/2 flex-col overflow-hidden bg-[#08090d] p-12 text-slate-100 md:flex">
         <WorkflowNetwork className="pointer-events-none absolute inset-0 size-full" />
 
         <div className="relative flex items-center gap-2.5">
@@ -20,7 +20,16 @@ export default function LoginPage() {
           <span className="text-lg font-bold tracking-tight">Automata</span>
         </div>
 
-        <div className="relative space-y-3">
+        {/* flex-1 justify-center centers this block in the space below the
+            brand row, matching the right panel's own `justify-center` —
+            same vertical-centering technique on both sides, rather than a
+            margin/gap value tuned by hand, so the two sides land in visibly
+            corresponding bands regardless of viewport height. As a side
+            effect, this also keeps the block well clear of both the very
+            top and the very bottom of the screen (where recording setups
+            crop out the OS's "Activate Windows" watermark, or where
+            browser-extension icons tend to sit). */}
+        <div className="relative flex flex-1 flex-col items-start justify-center space-y-3">
           <div className="inline-flex items-center gap-1.5 rounded-full bg-white/8 px-3 py-1 text-xs font-medium text-slate-300 backdrop-blur-sm">
             Enterprise automation, orchestrated
           </div>
