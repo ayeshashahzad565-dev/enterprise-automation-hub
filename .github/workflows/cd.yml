@@ -54,8 +54,10 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # No `type=gha` cache: that backend fails against GitHub's
+          # migrated Actions Cache service and takes the whole build down
+          # with it. It only ever saved build time. See security.yml's
+          # container-scan job for the same removal.
 
   build-push-frontend:
     runs-on: ubuntu-latest
@@ -98,5 +100,7 @@ jobs:
           build-args: |
             NEXT_PUBLIC_SUPABASE_URL=${{ vars.NEXT_PUBLIC_SUPABASE_URL || 'https://build-placeholder.supabase.co' }}
             NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ vars.NEXT_PUBLIC_SUPABASE_ANON_KEY || 'build-placeholder-anon-key' }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # No `type=gha` cache: that backend fails against GitHub's
+          # migrated Actions Cache service and takes the whole build down
+          # with it. It only ever saved build time. See security.yml's
+          # container-scan job for the same removal.

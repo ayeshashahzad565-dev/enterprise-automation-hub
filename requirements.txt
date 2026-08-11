@@ -48,7 +48,7 @@ click==8.4.2
     # via uvicorn
 colorama==0.4.6
     # via click
-cryptography==49.0.0
+cryptography==50.0.0
     # via pyjwt
 deprecation==2.1.0
     # via
@@ -62,7 +62,7 @@ h11==0.16.0
     # via
     #   httpcore
     #   uvicorn
-h2==4.4.0
+h2==4.4.1
     # via httpx
 hpack==4.2.0
     # via h2

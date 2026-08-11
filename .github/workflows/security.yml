@@ -143,8 +143,12 @@ jobs:
           load: true
           tags: eah-${{ matrix.image }}:scan
           build-args: ${{ matrix.build_args }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # No `cache-from/to: type=gha` here. That backend fails against
+          # GitHub's migrated Actions Cache service ("buildx failed with:
+          # Learn more at .../build-cache-backends"), which took the build
+          # down and, with it, both scan steps below. The cache only ever
+          # saved build time, never affected what got scanned, so dropping
+          # it costs nothing but a slower build.
 
       - name: Fail build on critical-severity image vulnerabilities
         uses: aquasecurity/trivy-action@v0.36.0
@@ -159,7 +163,13 @@ jobs:
         # bandit (-ll) and the npm critical/high audit steps above —
         # visible on every build, does not block on findings with no
         # available fix yet.
-        if: always()
+        #
+        # `if: success()`, not `if: always()`: with always(), a failed
+        # image build still ran this step, which then errored on the
+        # missing image and reported a second, misleading failure on top
+        # of the real one. There is nothing to scan if the build did not
+        # produce an image.
+        if: success()
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: eah-${{ matrix.image }}:scan
