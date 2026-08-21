@@ -302,7 +302,7 @@ This repository's full architecture documentation lives in `/docs`. Each documen
 | [Enterprise-Wide Search](docs/enterprise_search.md) | Cross-entity search entity coverage, trigram/full-text indexing rationale, pagination bounds, saved filters/history data model |
 | [AI Integration](docs/ai_integration.md) | Provider abstraction, multi-provider config, graceful fallback design, caching, authorization, and the full `/ai/*` endpoint reference |
 | [Design Philosophy](docs/design_philosophy.md) | Frontend interaction principles and page-level design conventions |
-| [Production Readiness Report](docs/production_readiness_report.md) | Final polish pass: fixes made, what was already at bar, bundle-size figures, and remaining technical debt |
+| [Deployment Checklist](docs/deployment_checklist.md) | The practical pre-deploy, deploy, and post-deploy checklist for taking a specific commit to production, plus the dependency-pinning and image-scanning guarantees behind it |
 
 ## Security
 

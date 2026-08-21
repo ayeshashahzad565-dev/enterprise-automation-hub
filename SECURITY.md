@@ -29,7 +29,7 @@ When reporting, please include as much of the following as possible:
 
 ## Security Expectations
 
-Enterprise Automation Hub's security model is documented in full in the [Architecture Design Document](docs/ADD.md#security-architecture), [Database Schema Design Document](docs/DSD.md#row-level-security), [API Design Document](docs/API-ADD.md#security-considerations), and [Deployment Guide](docs/DG.md#security-hardening). Reporters and contributors should be aware of the following baseline expectations:
+Enterprise Automation Hub's security model is documented in full in the [Architecture Design Document](docs/architecture.md#9-security-architecture), [Database Schema Design Document](docs/database_schema.md#9-row-level-security), [API Design Document](docs/api_design.md#24-security-considerations), and [Deployment Guide](docs/deployment.md#19-security-hardening). Reporters and contributors should be aware of the following baseline expectations:
 
 - **Authentication** is delegated entirely to Supabase Auth; this project does not implement its own credential storage.
 - **Authorization** is enforced both in application code and independently via PostgreSQL Row-Level Security. A report demonstrating that either layer alone can be bypassed to access unauthorized data is a valid and significant finding.
@@ -45,7 +45,7 @@ This project follows a coordinated disclosure process:
 
 1. **Acknowledgment.** We aim to acknowledge receipt of a vulnerability report within a reasonable timeframe.
 2. **Investigation.** The report is reviewed and, where necessary, reproduced against the architecture documented in `/docs`.
-3. **Remediation.** A fix is developed and tested per the [Testing Strategy Document](docs/TSD.md), including a regression test reproducing the original vulnerability.
+3. **Remediation.** A fix is developed and tested per the [Testing Strategy Document](docs/testing_strategy.md), including a regression test reproducing the original vulnerability.
 4. **Release.** The fix is released, and the reporter is credited (if desired) once the fix is available.
 5. **Public disclosure.** Details of the vulnerability are only published after a fix has been released, and only with the reporter's coordination.
 

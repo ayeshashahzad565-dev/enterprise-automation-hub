@@ -17,8 +17,9 @@
 > Repository → Database, dependency injection, RLS defense-in-depth,
 > configuration-driven workflows) still holds; every mention of Streamlit,
 > Plotly, or a `src/` path is historical and does not describe the shipped
-> system. For the current architecture, see `docs/history/project_summary.md`,
-> `docs/deployment.md`, and `docs/ai_integration.md`.
+> system. For the current architecture, see the "Architecture Overview" and
+> "Technology Stack" sections of `README.md`, `docs/deployment.md`, and
+> `docs/ai_integration.md`.
 
 ---
 
