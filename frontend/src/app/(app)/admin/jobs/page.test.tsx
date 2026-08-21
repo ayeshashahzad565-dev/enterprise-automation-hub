@@ -109,12 +109,17 @@ function stubDefaults() {
 
 describe("AdminJobsPage", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    // resetAllMocks, not clearAllMocks: clearAllMocks only wipes recorded
+    // calls, leaving any *unconsumed* `mockResolvedValueOnce` queued on a
+    // mock to leak into the next test and satisfy its first call instead.
+    // Resetting drops the queue too; stubDefaults() immediately restores
+    // the baseline implementations below.
+    vi.resetAllMocks();
     stubDefaults();
   });
 
   it("shows loading skeletons, then renders queue stats, scheduled jobs, and job history once data arrives", async () => {
-    listJobsMock.mockResolvedValueOnce(pageOf([buildJob({ task_type: "send_invitation_email" })]));
+    listJobsMock.mockResolvedValue(pageOf([buildJob({ task_type: "send_invitation_email" })]));
 
     renderWithQueryClient(<AdminJobsPage />);
 
@@ -131,7 +136,7 @@ describe("AdminJobsPage", () => {
   });
 
   it("renders the inactive state when queue_depth/delayed_count are null", async () => {
-    getQueueStatsMock.mockResolvedValueOnce(
+    getQueueStatsMock.mockResolvedValue(
       buildQueueStats({ queue_depth: null, delayed_count: null, dead_letter_count: { default: 0 } }),
     );
 
@@ -184,7 +189,7 @@ describe("AdminJobsPage", () => {
   });
 
   it("disables the trigger-now button while a scheduled job is currently running", async () => {
-    listScheduledJobsMock.mockResolvedValueOnce([
+    listScheduledJobsMock.mockResolvedValue([
       buildScheduledJob({ currently_running: true }),
     ]);
     renderWithQueryClient(<AdminJobsPage />);
@@ -250,7 +255,7 @@ describe("AdminJobsPage", () => {
   });
 
   it("opens the job detail panel with payload JSON when a history row is clicked", async () => {
-    listJobsMock.mockResolvedValueOnce(
+    listJobsMock.mockResolvedValue(
       pageOf([
         buildJob({
           task_type: "send_reminder",

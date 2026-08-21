@@ -3,11 +3,11 @@ import path from "node:path";
 import { configDefaults, defineConfig } from "vitest/config";
 
 /**
- * First frontend test infrastructure in this repository (Milestone 7 —
- * see that milestone's implementation report). Vitest + React Testing
- * Library was chosen as the minimal, standard pairing for a Next.js/React
- * app: no custom babel/webpack config to fight, and it reuses the same
- * `@/*` path alias already configured in `tsconfig.json`.
+ * Frontend test infrastructure. Vitest + React Testing Library was chosen
+ * as the minimal, standard pairing for a Next.js/React app: no custom
+ * babel/webpack config to fight, and it reuses the same `@/*` path alias
+ * already configured in `tsconfig.json`. See `docs/testing_strategy.md`
+ * for how this fits the wider test strategy.
  */
 export default defineConfig({
   plugins: [react()],
