@@ -448,9 +448,19 @@ class TestSchemaToRecordMapping:
         self, pg_conn, table_name, record_type
     ) -> None:
         with pg_conn.cursor() as cur:
+            # `is_generated = 'ALWAYS'` columns are excluded deliberately.
+            # Migration 0018 adds `search_vector` to requests and comments
+            # as `generated always as (...) stored` — the database derives
+            # it from other columns, and Postgres rejects any attempt to
+            # insert or update it directly. A *Record dataclass exists to
+            # carry values the repository reads and writes, so a generated
+            # column must not appear there; requiring one would break every
+            # insert. Non-generated columns are still matched exactly, so
+            # this keeps the drift protection the test exists to provide.
             cur.execute(
                 "select column_name from information_schema.columns "
-                "where table_schema = 'public' and table_name = %s;",
+                "where table_schema = 'public' and table_name = %s "
+                "and is_generated <> 'ALWAYS';",
                 (table_name,),
             )
             actual_columns = {row[0] for row in cur.fetchall()}

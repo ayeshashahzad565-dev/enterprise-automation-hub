@@ -55,6 +55,22 @@ ENV NODE_ENV=production \
     PORT=3000 \
     HOSTNAME=0.0.0.0
 
+# The base image bundles npm and corepack, and npm vendors its own copy of
+# `tar` — currently 7.5.11, which carries CVE-2026-59873 (gzip-bomb denial
+# of service, fixed in 7.5.19). Trivy scans that vendored package.json and
+# fails this image on it, even though `tar` appears nowhere in
+# package-lock.json and `npm audit` therefore never sees it.
+#
+# A Next.js standalone build runs on `node server.js` alone: no package
+# manager is involved at runtime, and the HEALTHCHECK below is plain
+# `node -e`. Removing them drops the vulnerable code from the runtime image
+# rather than shipping it unused, and trims the attack surface generally.
+RUN rm -rf /usr/local/lib/node_modules/npm \
+           /usr/local/lib/node_modules/corepack \
+           /usr/local/bin/npm \
+           /usr/local/bin/npx \
+           /usr/local/bin/corepack
+
 COPY --from=builder /app/public ./public
 COPY --from=builder --chown=node:node /app/.next/standalone ./
 COPY --from=builder --chown=node:node /app/.next/static ./.next/static
