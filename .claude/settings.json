@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(node -e \"console.log\\(require\\('./node_modules/cmdk/package.json'\\).version\\)\")",
-      "Bash(./.venv/Scripts/python.exe -m py_compile scripts/seed_enterprise_demo.py)",
-      "Bash(./.venv/Scripts/python.exe -m ruff check scripts/seed_enterprise_demo.py)"
-    ]
-  }
-}

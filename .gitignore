@@ -103,6 +103,14 @@ supabase/.branches/
 /dist/
 
 # ==============================================================================
+# Local Editor / Tooling State
+# ==============================================================================
+# Per-developer editor and tooling config — machine-local preferences, not
+# project source. frontend/.gitignore already ignores its own copy; this is
+# the repo-root equivalent.
+.claude/
+
+# ==============================================================================
 # OS Files
 # ==============================================================================
 .DS_Store
