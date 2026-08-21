@@ -26,14 +26,27 @@ from logging.config import fileConfig
 
 from alembic import context
 from dotenv import load_dotenv
-from sqlalchemy import String, engine_from_config, pool
+from sqlalchemy import Connection, engine_from_config, pool, text
 
-# Alembic's default `alembic_version.version_num` column is VARCHAR(32).
-# Several revision ids in this project's history (e.g.
-# "0008_user_invitations_status_expires_at_index", 45 chars) exceed that,
-# which breaks `alembic upgrade head` on a fresh database with
-# `StringDataRightTruncation`. Widened well past the longest current id.
-_VERSION_TABLE_COLUMN_TYPE = String(128)
+# Alembic hardcodes `alembic_version.version_num` as VARCHAR(32) in
+# `alembic.ddl.impl.DefaultImpl._version_table_impl`. Several revision ids
+# in this project's history exceed that — the longest,
+# "0008_user_invitations_status_expires_at_index", is 45 characters — so
+# `alembic upgrade head` against a fresh database got as far as recording
+# revision 0008 and then failed with:
+#
+#   psycopg.errors.StringDataRightTruncation:
+#   value too long for type character varying(32)
+#
+# There is no `context.configure()` option for this. An earlier attempt
+# passed `version_table_column_type=String(128)`, but no such parameter
+# exists in Alembic; unrecognized keywords are absorbed into the opts dict
+# and silently ignored, so it never had any effect and the truncation
+# remained. Alembic only *creates* the version table when one is not
+# already present, so creating it ourselves first — wide enough for the
+# ids this project actually uses — is what genuinely fixes it.
+_VERSION_TABLE = "alembic_version"
+_VERSION_NUM_LENGTH = 128
 
 load_dotenv()
 
@@ -75,6 +88,33 @@ def _database_url() -> str:
     return url
 
 
+def _ensure_wide_version_table(connection: Connection) -> None:
+    """Create or widen ``alembic_version`` so long revision ids fit.
+
+    Both statements are idempotent, so this is safe on every run:
+
+    * ``CREATE TABLE IF NOT EXISTS`` wins the race on a fresh database —
+      Alembic finds a version table already present and skips its own
+      VARCHAR(32) creation.
+    * ``ALTER COLUMN ... TYPE`` repairs a database that Alembic already
+      created narrowly, and is a no-op when the column is already wide.
+    """
+    connection.execute(
+        text(
+            f"CREATE TABLE IF NOT EXISTS {_VERSION_TABLE} ("
+            f"  version_num VARCHAR({_VERSION_NUM_LENGTH}) NOT NULL,"
+            f"  CONSTRAINT {_VERSION_TABLE}_pkc PRIMARY KEY (version_num)"
+            f")"
+        )
+    )
+    connection.execute(
+        text(
+            f"ALTER TABLE {_VERSION_TABLE} "
+            f"ALTER COLUMN version_num TYPE VARCHAR({_VERSION_NUM_LENGTH})"
+        )
+    )
+
+
 def run_migrations_offline() -> None:
     """Emit migration SQL without opening a live database connection."""
     context.configure(
@@ -82,9 +122,15 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
-        version_table_column_type=_VERSION_TABLE_COLUMN_TYPE,
     )
     with context.begin_transaction():
+        # Offline mode never connects, so `_ensure_wide_version_table`
+        # cannot run here. Alembic emits its own VARCHAR(32) version-table
+        # DDL into the generated script, and adding a second CREATE for the
+        # same table would only make that script fail on execution. Anyone
+        # running `alembic upgrade --sql` must widen version_num by hand
+        # before applying the output; the online path below, which is what
+        # CI and every documented deployment uses, handles it directly.
         context.run_migrations()
 
 
@@ -94,10 +140,14 @@ def run_migrations_online() -> None:
     configuration["sqlalchemy.url"] = _database_url()
     connectable = engine_from_config(configuration, prefix="sqlalchemy.", poolclass=pool.NullPool)
     with connectable.connect() as connection:
+        # Must precede context.configure(): Alembic inspects for the version
+        # table as part of running migrations, and only creates its own
+        # narrow one when nothing is there yet.
+        _ensure_wide_version_table(connection)
+        connection.commit()
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
-            version_table_column_type=_VERSION_TABLE_COLUMN_TYPE,
         )
         with context.begin_transaction():
             context.run_migrations()
