@@ -24,7 +24,14 @@ def specific_user_stage(
         "order": order,
         "name": name,
         "assignment_strategy": "specific_user",
-        "assigned_user_id": user_id,
+        # str, not the UUID itself: this dict is the *stored* JSONB shape,
+        # and the service persists `document.model_dump(mode="json")`, which
+        # renders a UUID as a string. Emitting a raw UUID here only worked
+        # against the in-memory fakes — a real insert goes out as JSON, and
+        # json.dumps rejects UUID, which surfaced as an opaque
+        # "Database operation 'insert' failed on 'workflow_definitions'".
+        # Mirrors department_queue_stage's existing `role.value`.
+        "assigned_user_id": str(user_id),
         "escalation_hours": escalation_hours,
     }
 
