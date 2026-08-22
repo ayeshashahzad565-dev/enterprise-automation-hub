@@ -20,7 +20,7 @@ pytestmark = pytest.mark.integration
 
 class TestOptimisticLockingAgainstRealPostgres:
     def test_a_stale_version_update_is_rejected_by_the_real_database(
-        self, real_repos, make_test_profile
+        self, real_repos, make_test_profile, test_company_id
     ):
         employee = make_test_profile(role=UserRole.EMPLOYEE)
         admin = make_test_profile(role=UserRole.ADMIN)
@@ -31,18 +31,21 @@ class TestOptimisticLockingAgainstRealPostgres:
             version=1,
             definition={"stages": [specific_user_stage(1, "Manager Review", user_id=approver.id)]},
             created_by=admin.id,
+            company_id=test_company_id,
         )
         request = real_repos.request.create_request(
             requester_id=employee.id,
             workflow_definition_id=definition.id,
             request_type=request_type,
             title="Optimistic lock test",
+            company_id=test_company_id,
         )
         stage = real_repos.workflow_stage.create_stage(
             request_id=request.id,
             stage_order=1,
             stage_name="Manager Review",
             assigned_to=approver.id,
+            company_id=test_company_id,
         )
         assert stage.version == 1
 

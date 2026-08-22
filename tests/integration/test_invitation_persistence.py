@@ -112,7 +112,7 @@ def invitation_service(real_repos, supabase_service_client) -> InvitationService
 
 class TestInvitationCreation:
     def test_create_invitation_persists_all_fields(
-        self, real_repos, make_test_profile, invitation_cleanup
+        self, real_repos, make_test_profile, invitation_cleanup, test_company_id
     ):
         admin = make_test_profile(role=UserRole.ADMIN)
         email = _unique_email("create")
@@ -125,6 +125,7 @@ class TestInvitationCreation:
             token_hash="a" * 64,
             expires_at=utc_now() + timedelta(hours=72),
             invited_by=admin.id,
+            company_id=test_company_id,
         )
         invitation_cleanup.invitation_ids.append(created.id)
 
@@ -139,7 +140,7 @@ class TestInvitationCreation:
         assert reloaded.version == 1
 
     def test_a_second_pending_invitation_for_the_same_email_violates_the_partial_unique_index(
-        self, real_repos, make_test_profile, invitation_cleanup
+        self, real_repos, make_test_profile, invitation_cleanup, test_company_id
     ):
         """The database-level backstop
         ``user_invitations_pending_email_idx`` (migration 0007) — the
@@ -155,6 +156,7 @@ class TestInvitationCreation:
             token_hash="b" * 64,
             expires_at=utc_now() + timedelta(hours=72),
             invited_by=admin.id,
+            company_id=test_company_id,
         )
         invitation_cleanup.invitation_ids.append(first.id)
 
@@ -165,10 +167,11 @@ class TestInvitationCreation:
                 token_hash="c" * 64,
                 expires_at=utc_now() + timedelta(hours=72),
                 invited_by=admin.id,
+                company_id=test_company_id,
             )
 
     def test_a_new_pending_invitation_is_allowed_once_the_first_is_revoked(
-        self, real_repos, make_test_profile, invitation_cleanup
+        self, real_repos, make_test_profile, invitation_cleanup, test_company_id
     ):
         """Proves the partial index's ``where status = 'pending'`` scope
         is real: revoking the first invitation frees its email address
@@ -183,6 +186,7 @@ class TestInvitationCreation:
             token_hash="d" * 64,
             expires_at=utc_now() + timedelta(hours=72),
             invited_by=admin.id,
+            company_id=test_company_id,
         )
         invitation_cleanup.invitation_ids.append(first.id)
         real_repos.invitation.update_status_with_lock(
@@ -198,6 +202,7 @@ class TestInvitationCreation:
             token_hash="e" * 64,
             expires_at=utc_now() + timedelta(hours=72),
             invited_by=admin.id,
+            company_id=test_company_id,
         )
         invitation_cleanup.invitation_ids.append(second.id)
 
@@ -207,7 +212,7 @@ class TestInvitationCreation:
 
 class TestOptimisticLocking:
     def test_a_stale_version_update_is_rejected_by_the_real_database(
-        self, real_repos, make_test_profile, invitation_cleanup
+        self, real_repos, make_test_profile, invitation_cleanup, test_company_id
     ):
         admin = make_test_profile(role=UserRole.ADMIN)
         created = real_repos.invitation.create_invitation(
@@ -216,6 +221,7 @@ class TestOptimisticLocking:
             token_hash="f" * 64,
             expires_at=utc_now() + timedelta(hours=72),
             invited_by=admin.id,
+            company_id=test_company_id,
         )
         invitation_cleanup.invitation_ids.append(created.id)
         assert created.version == 1
@@ -243,7 +249,7 @@ class TestOptimisticLocking:
 
 class TestAcceptanceAndProfileCreation:
     def test_accepting_an_invitation_provisions_a_real_profile_via_the_service(
-        self, real_repos, make_test_profile, invitation_cleanup, invitation_service
+        self, real_repos, make_test_profile, invitation_cleanup, invitation_service, test_company_id
     ):
         """End-to-end through the real, unmodified ``InvitationService``
         — token generation/hashing, the real Supabase Auth Admin API
@@ -262,6 +268,7 @@ class TestAcceptanceAndProfileCreation:
             token_hash=hash_invitation_token(raw_token),
             expires_at=utc_now() + timedelta(hours=72),
             invited_by=admin.id,
+            company_id=test_company_id,
         )
         invitation_cleanup.invitation_ids.append(created.id)
         invitation_cleanup.accepted_profile_ids.append(created.id)  # deterministic id scheme
@@ -282,7 +289,7 @@ class TestAcceptanceAndProfileCreation:
 
 class TestEffectiveStatusFiltering:
     def test_expires_after_and_expires_at_or_before_correctly_partition_rows(
-        self, real_repos, make_test_profile, invitation_cleanup
+        self, real_repos, make_test_profile, invitation_cleanup, test_company_id
     ):
         """The real-database counterpart to
         ``tests/unit/test_invitation_service.py``'s fake-backed
@@ -302,6 +309,7 @@ class TestEffectiveStatusFiltering:
             token_hash=uuid.uuid4().hex + uuid.uuid4().hex,
             expires_at=reference_now + timedelta(hours=1),
             invited_by=admin.id,
+            company_id=test_company_id,
         )
         stale = real_repos.invitation.create_invitation(
             email=_unique_email("stale"),
@@ -309,16 +317,21 @@ class TestEffectiveStatusFiltering:
             token_hash=uuid.uuid4().hex + uuid.uuid4().hex,
             expires_at=reference_now - timedelta(hours=1),
             invited_by=admin.id,
+            company_id=test_company_id,
         )
         invitation_cleanup.invitation_ids.extend([fresh.id, stale.id])
 
         pending_effective = real_repos.invitation.list_invitations(
-            status=InvitationStatus.PENDING, expires_after=reference_now, page=Page(size=100)
+            status=InvitationStatus.PENDING,
+            expires_after=reference_now,
+            page=Page(size=100),
+            company_id=test_company_id,
         )
         expired_effective = real_repos.invitation.list_invitations(
             status=InvitationStatus.PENDING,
             expires_at_or_before=reference_now,
             page=Page(size=100),
+            company_id=test_company_id,
         )
 
         assert fresh.id in [i.id for i in pending_effective.items]
@@ -336,7 +349,7 @@ class TestSearchEscapingAgainstRealPostgres:
     """
 
     def test_a_literal_percent_in_the_search_term_is_not_treated_as_an_ilike_wildcard(
-        self, real_repos, make_test_profile, invitation_cleanup
+        self, real_repos, make_test_profile, invitation_cleanup, test_company_id
     ):
         admin = make_test_profile(role=UserRole.ADMIN)
         unique = uuid.uuid4().hex[:8]
@@ -346,6 +359,7 @@ class TestSearchEscapingAgainstRealPostgres:
             token_hash=uuid.uuid4().hex + uuid.uuid4().hex,
             expires_at=utc_now() + timedelta(hours=72),
             invited_by=admin.id,
+            company_id=test_company_id,
         )
         decoy = real_repos.invitation.create_invitation(
             email=_unique_email("decoy"),
@@ -353,20 +367,23 @@ class TestSearchEscapingAgainstRealPostgres:
             token_hash=uuid.uuid4().hex + uuid.uuid4().hex,
             expires_at=utc_now() + timedelta(hours=72),
             invited_by=admin.id,
+            company_id=test_company_id,
         )
         invitation_cleanup.invitation_ids.extend([literal_percent.id, decoy.id])
 
         # If "%" were sent to Postgres unescaped, ILIKE would interpret
         # it as "any sequence of characters", matching both rows. Escaped
         # correctly, only the row with a literal "%" matches.
-        result = real_repos.invitation.list_invitations(query=f"{unique} 50%", page=Page(size=100))
+        result = real_repos.invitation.list_invitations(
+            query=f"{unique} 50%", page=Page(size=100), company_id=test_company_id
+        )
 
         matched_ids = {i.id for i in result.items}
         assert literal_percent.id in matched_ids
         assert decoy.id not in matched_ids
 
     def test_find_pending_by_email_matches_case_insensitively_and_exactly(
-        self, real_repos, make_test_profile, invitation_cleanup
+        self, real_repos, make_test_profile, invitation_cleanup, test_company_id
     ):
         admin = make_test_profile(role=UserRole.ADMIN)
         email = _unique_email("Case.Sensitive")
@@ -376,16 +393,19 @@ class TestSearchEscapingAgainstRealPostgres:
             token_hash=uuid.uuid4().hex + uuid.uuid4().hex,
             expires_at=utc_now() + timedelta(hours=72),
             invited_by=admin.id,
+            company_id=test_company_id,
         )
         invitation_cleanup.invitation_ids.append(created.id)
 
-        found = real_repos.invitation.find_pending_by_email(email.upper())
+        found = real_repos.invitation.find_pending_by_email(
+            email.upper(), company_id=test_company_id
+        )
 
         assert found is not None
         assert found.id == created.id
 
     def test_a_search_term_containing_comma_and_parenthesis_never_breaks_the_or_filter(
-        self, real_repos, make_test_profile, invitation_cleanup
+        self, real_repos, make_test_profile, invitation_cleanup, test_company_id
     ):
         """The ``quote_postgrest_filter_value`` fix's real-world proof:
         a free-text search containing PostgREST's own filter-structural
@@ -403,6 +423,7 @@ class TestSearchEscapingAgainstRealPostgres:
             token_hash=uuid.uuid4().hex + uuid.uuid4().hex,
             expires_at=utc_now() + timedelta(hours=72),
             invited_by=admin.id,
+            company_id=test_company_id,
         )
         invitation_cleanup.invitation_ids.append(created.id)
 
@@ -412,7 +433,9 @@ class TestSearchEscapingAgainstRealPostgres:
         # would surface as an InvalidQueryError/RepositoryError here) and
         # must not match anything, since no row's name/email actually
         # contains this literal payload.
-        result = real_repos.invitation.list_invitations(query=malicious_query, page=Page())
+        result = real_repos.invitation.list_invitations(
+            query=malicious_query, page=Page(), company_id=test_company_id
+        )
 
         assert result.items == []
         assert result.total_records == 0

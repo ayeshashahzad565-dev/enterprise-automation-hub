@@ -17,7 +17,9 @@ pytestmark = pytest.mark.integration
 
 
 class TestWorkflowDefinitionPersistence:
-    def test_the_full_stage_document_round_trips_through_jsonb(self, real_repos, make_test_profile):
+    def test_the_full_stage_document_round_trips_through_jsonb(
+        self, real_repos, make_test_profile, test_company_id
+    ):
         admin = make_test_profile(role=UserRole.ADMIN)
         approver = make_test_profile(role=UserRole.APPROVER)
         request_type = f"itest_{uuid.uuid4().hex[:8]}"
@@ -29,7 +31,11 @@ class TestWorkflowDefinitionPersistence:
         ]
 
         created = real_repos.workflow_definition.create_definition(
-            request_type=request_type, version=1, definition={"stages": stages}, created_by=admin.id
+            request_type=request_type,
+            version=1,
+            definition={"stages": stages},
+            created_by=admin.id,
+            company_id=test_company_id,
         )
         reloaded = real_repos.workflow_definition.get_by_id(created.id)
 
@@ -41,19 +47,26 @@ class TestWorkflowDefinitionPersistence:
 
 
 class TestWorkflowStagePersistence:
-    def test_stages_are_listed_in_ascending_stage_order(self, real_repos, make_test_profile):
+    def test_stages_are_listed_in_ascending_stage_order(
+        self, real_repos, make_test_profile, test_company_id
+    ):
         employee = make_test_profile(role=UserRole.EMPLOYEE)
         admin = make_test_profile(role=UserRole.ADMIN)
         approver = make_test_profile(role=UserRole.APPROVER)
         request_type = f"itest_{uuid.uuid4().hex[:8]}"
         definition = real_repos.workflow_definition.create_definition(
-            request_type=request_type, version=1, definition={"stages": []}, created_by=admin.id
+            request_type=request_type,
+            version=1,
+            definition={"stages": []},
+            created_by=admin.id,
+            company_id=test_company_id,
         )
         request = real_repos.request.create_request(
             requester_id=employee.id,
             workflow_definition_id=definition.id,
             request_type=request_type,
             title="Multi-stage persistence test",
+            company_id=test_company_id,
         )
         # Intentionally created out of order to prove the repository
         # sorts by stage_order rather than insertion order.
@@ -62,12 +75,14 @@ class TestWorkflowStagePersistence:
             stage_order=2,
             stage_name="Finance Review",
             assigned_to=approver.id,
+            company_id=test_company_id,
         )
         real_repos.workflow_stage.create_stage(
             request_id=request.id,
             stage_order=1,
             stage_name="Manager Review",
             assigned_to=approver.id,
+            company_id=test_company_id,
         )
 
         stages = real_repos.workflow_stage.list_for_request(request.id).items
@@ -75,19 +90,26 @@ class TestWorkflowStagePersistence:
         assert [s.stage_order for s in stages] == [1, 2]
         assert [s.stage_name for s in stages] == ["Manager Review", "Finance Review"]
 
-    def test_get_highest_stage_order_reflects_persisted_stages(self, real_repos, make_test_profile):
+    def test_get_highest_stage_order_reflects_persisted_stages(
+        self, real_repos, make_test_profile, test_company_id
+    ):
         employee = make_test_profile(role=UserRole.EMPLOYEE)
         admin = make_test_profile(role=UserRole.ADMIN)
         approver = make_test_profile(role=UserRole.APPROVER)
         request_type = f"itest_{uuid.uuid4().hex[:8]}"
         definition = real_repos.workflow_definition.create_definition(
-            request_type=request_type, version=1, definition={"stages": []}, created_by=admin.id
+            request_type=request_type,
+            version=1,
+            definition={"stages": []},
+            created_by=admin.id,
+            company_id=test_company_id,
         )
         request = real_repos.request.create_request(
             requester_id=employee.id,
             workflow_definition_id=definition.id,
             request_type=request_type,
             title="Highest order test",
+            company_id=test_company_id,
         )
         assert real_repos.workflow_stage.get_highest_stage_order(request.id) == 0
 
@@ -96,34 +118,44 @@ class TestWorkflowStagePersistence:
             stage_order=1,
             stage_name="Manager Review",
             assigned_to=approver.id,
+            company_id=test_company_id,
         )
         assert real_repos.workflow_stage.get_highest_stage_order(request.id) == 1
 
-    def test_list_decided_for_request_excludes_pending_stages(self, real_repos, make_test_profile):
+    def test_list_decided_for_request_excludes_pending_stages(
+        self, real_repos, make_test_profile, test_company_id
+    ):
         employee = make_test_profile(role=UserRole.EMPLOYEE)
         admin = make_test_profile(role=UserRole.ADMIN)
         approver = make_test_profile(role=UserRole.APPROVER)
         request_type = f"itest_{uuid.uuid4().hex[:8]}"
         definition = real_repos.workflow_definition.create_definition(
-            request_type=request_type, version=1, definition={"stages": []}, created_by=admin.id
+            request_type=request_type,
+            version=1,
+            definition={"stages": []},
+            created_by=admin.id,
+            company_id=test_company_id,
         )
         request = real_repos.request.create_request(
             requester_id=employee.id,
             workflow_definition_id=definition.id,
             request_type=request_type,
             title="Decided stages test",
+            company_id=test_company_id,
         )
         decided_stage = real_repos.workflow_stage.create_stage(
             request_id=request.id,
             stage_order=1,
             stage_name="Manager Review",
             assigned_to=approver.id,
+            company_id=test_company_id,
         )
         real_repos.workflow_stage.create_stage(
             request_id=request.id,
             stage_order=2,
             stage_name="Finance Review",
             assigned_to=approver.id,
+            company_id=test_company_id,
         )
         real_repos.approval.approve_stage(
             decided_stage.id, expected_version=1, decided_by=approver.id

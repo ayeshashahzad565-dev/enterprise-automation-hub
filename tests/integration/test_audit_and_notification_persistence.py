@@ -13,19 +13,24 @@ pytestmark = pytest.mark.integration
 
 class TestAuditLogPersistence:
     def test_record_event_persists_action_actor_request_and_metadata(
-        self, real_repos, make_test_profile
+        self, real_repos, make_test_profile, test_company_id
     ):
         employee = make_test_profile(role=UserRole.EMPLOYEE)
         admin = make_test_profile(role=UserRole.ADMIN)
         request_type = f"itest_{uuid.uuid4().hex[:8]}"
         definition = real_repos.workflow_definition.create_definition(
-            request_type=request_type, version=1, definition={"stages": []}, created_by=admin.id
+            request_type=request_type,
+            version=1,
+            definition={"stages": []},
+            created_by=admin.id,
+            company_id=test_company_id,
         )
         request = real_repos.request.create_request(
             requester_id=employee.id,
             workflow_definition_id=definition.id,
             request_type=request_type,
             title="Audit persistence test",
+            company_id=test_company_id,
         )
 
         entry = real_repos.audit.record_event(
@@ -41,18 +46,25 @@ class TestAuditLogPersistence:
         assert reloaded.request_id == request.id
         assert reloaded.metadata == {"note": "created via integration test"}
 
-    def test_list_for_request_returns_entries_chronologically(self, real_repos, make_test_profile):
+    def test_list_for_request_returns_entries_chronologically(
+        self, real_repos, make_test_profile, test_company_id
+    ):
         employee = make_test_profile(role=UserRole.EMPLOYEE)
         admin = make_test_profile(role=UserRole.ADMIN)
         request_type = f"itest_{uuid.uuid4().hex[:8]}"
         definition = real_repos.workflow_definition.create_definition(
-            request_type=request_type, version=1, definition={"stages": []}, created_by=admin.id
+            request_type=request_type,
+            version=1,
+            definition={"stages": []},
+            created_by=admin.id,
+            company_id=test_company_id,
         )
         request = real_repos.request.create_request(
             requester_id=employee.id,
             workflow_definition_id=definition.id,
             request_type=request_type,
             title="Chronological audit test",
+            company_id=test_company_id,
         )
         real_repos.audit.record_event(
             action=AuditAction.REQUEST_CREATED, actor_id=employee.id, request_id=request.id
@@ -77,25 +89,31 @@ class TestAuditLogPersistence:
         assert len(entries_for_a) == 1
 
     def test_search_matches_action_substring_and_respects_request_ids_scope(
-        self, real_repos, make_test_profile
+        self, real_repos, make_test_profile, test_company_id
     ):
         employee = make_test_profile(role=UserRole.EMPLOYEE)
         admin = make_test_profile(role=UserRole.ADMIN)
         request_type = f"itest_{uuid.uuid4().hex[:8]}"
         definition = real_repos.workflow_definition.create_definition(
-            request_type=request_type, version=1, definition={"stages": []}, created_by=admin.id
+            request_type=request_type,
+            version=1,
+            definition={"stages": []},
+            created_by=admin.id,
+            company_id=test_company_id,
         )
         in_scope = real_repos.request.create_request(
             requester_id=employee.id,
             workflow_definition_id=definition.id,
             request_type=request_type,
             title="In scope request",
+            company_id=test_company_id,
         )
         out_of_scope = real_repos.request.create_request(
             requester_id=employee.id,
             workflow_definition_id=definition.id,
             request_type=request_type,
             title="Out of scope request",
+            company_id=test_company_id,
         )
         real_repos.audit.record_event(
             action=AuditAction.REQUEST_CREATED, actor_id=employee.id, request_id=in_scope.id

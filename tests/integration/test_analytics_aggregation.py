@@ -33,7 +33,11 @@ class TestAnalyticsRepositoryAggregation:
         admin = make_test_profile(role=UserRole.ADMIN)
         request_type = f"itest_analytics_status_{uuid.uuid4().hex[:8]}"
         definition = real_repos.workflow_definition.create_definition(
-            request_type=request_type, version=1, definition={"stages": []}, created_by=admin.id
+            request_type=request_type,
+            version=1,
+            definition={"stages": []},
+            created_by=admin.id,
+            company_id=test_company_id,
         )
         pending = real_repos.request.create_request(
             requester_id=employee.id,
@@ -92,10 +96,18 @@ class TestAnalyticsRepositoryAggregation:
         type_a = f"itest_analytics_type_a_{uuid.uuid4().hex[:8]}"
         type_b = f"itest_analytics_type_b_{uuid.uuid4().hex[:8]}"
         definition_a = real_repos.workflow_definition.create_definition(
-            request_type=type_a, version=1, definition={"stages": []}, created_by=admin.id
+            request_type=type_a,
+            version=1,
+            definition={"stages": []},
+            created_by=admin.id,
+            company_id=test_company_id,
         )
         definition_b = real_repos.workflow_definition.create_definition(
-            request_type=type_b, version=1, definition={"stages": []}, created_by=admin.id
+            request_type=type_b,
+            version=1,
+            definition={"stages": []},
+            created_by=admin.id,
+            company_id=test_company_id,
         )
         for title in ("A1", "A2"):
             real_repos.request.create_request(
@@ -129,7 +141,11 @@ class TestAnalyticsRepositoryAggregation:
         admin = make_test_profile(role=UserRole.ADMIN)
         request_type = f"itest_analytics_dept_{uuid.uuid4().hex[:8]}"
         definition = real_repos.workflow_definition.create_definition(
-            request_type=request_type, version=1, definition={"stages": []}, created_by=admin.id
+            request_type=request_type,
+            version=1,
+            definition={"stages": []},
+            created_by=admin.id,
+            company_id=test_company_id,
         )
         real_repos.request.create_request(
             requester_id=employee.id,
@@ -178,6 +194,7 @@ class TestAnalyticsRepositoryAggregation:
             version=1,
             definition={"stages": [specific_user_stage(1, "Manager Review", user_id=approver.id)]},
             created_by=admin.id,
+            company_id=test_company_id,
         )
         request = real_repos.request.create_request(
             requester_id=employee.id,
@@ -191,6 +208,7 @@ class TestAnalyticsRepositoryAggregation:
             stage_order=1,
             stage_name="Manager Review",
             assigned_to=approver.id,
+            company_id=test_company_id,
         )
         real_repos.approval.approve_stage(stage.id, expected_version=1, decided_by=approver.id)
         with _committing_pg_conn.cursor() as cur:
@@ -225,7 +243,11 @@ class TestAnalyticsRepositoryAggregation:
         admin = make_test_profile(role=UserRole.ADMIN)
         request_type = f"itest_analytics_no_decisions_{uuid.uuid4().hex[:8]}"
         definition = real_repos.workflow_definition.create_definition(
-            request_type=request_type, version=1, definition={"stages": []}, created_by=admin.id
+            request_type=request_type,
+            version=1,
+            definition={"stages": []},
+            created_by=admin.id,
+            company_id=test_company_id,
         )
         real_repos.request.create_request(
             requester_id=employee.id,
