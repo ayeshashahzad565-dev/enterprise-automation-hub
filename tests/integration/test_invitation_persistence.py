@@ -465,13 +465,15 @@ class TestRowLevelSecurity:
         with pg_conn.cursor() as cur:
             cur.execute(
                 "insert into public.user_invitations "
-                "(id, email, full_name, token_hash, expires_at, invited_by) "
-                "values (%s, %s, %s, %s, now() + interval '72 hours', %s);",
+                "(id, email, full_name, token_hash, expires_at, invited_by, company_id) "
+                "values (%s, %s, %s, %s, now() + interval '72 hours', %s, "
+                "(select company_id from public.profiles where id = %s));",
                 (
                     str(invitation_id),
                     _unique_email("rls"),
                     "RLS Test Subject",
                     uuid.uuid4().hex + uuid.uuid4().hex,
+                    str(admin.id),
                     str(admin.id),
                 ),
             )
@@ -492,13 +494,15 @@ class TestRowLevelSecurity:
         with pg_conn.cursor() as cur:
             cur.execute(
                 "insert into public.user_invitations "
-                "(id, email, full_name, token_hash, expires_at, invited_by) "
-                "values (%s, %s, %s, %s, now() + interval '72 hours', %s);",
+                "(id, email, full_name, token_hash, expires_at, invited_by, company_id) "
+                "values (%s, %s, %s, %s, now() + interval '72 hours', %s, "
+                "(select company_id from public.profiles where id = %s));",
                 (
                     str(invitation_id),
                     _unique_email("rls-admin"),
                     "RLS Admin Subject",
                     uuid.uuid4().hex + uuid.uuid4().hex,
+                    str(admin.id),
                     str(admin.id),
                 ),
             )
@@ -529,13 +533,15 @@ class TestRowLevelSecurity:
             with pytest.raises(psycopg.errors.InsufficientPrivilege):
                 cur.execute(
                     "insert into public.user_invitations "
-                    "(id, email, full_name, token_hash, expires_at, invited_by) "
-                    "values (%s, %s, %s, %s, now() + interval '72 hours', %s);",
+                    "(id, email, full_name, token_hash, expires_at, invited_by, company_id) "
+                    "values (%s, %s, %s, %s, now() + interval '72 hours', %s, "
+                    "(select company_id from public.profiles where id = %s));",
                     (
                         str(uuid.uuid4()),
                         _unique_email("rls-insert-denied"),
                         "Should Not Insert",
                         uuid.uuid4().hex + uuid.uuid4().hex,
+                        str(employee.id),
                         str(employee.id),
                     ),
                 )

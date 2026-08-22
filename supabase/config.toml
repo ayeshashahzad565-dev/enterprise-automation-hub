@@ -50,7 +50,16 @@ jwt_expiry = 3600
 enable_signup = false
 
 [auth.email]
-enable_signup = false
+# This is the email *provider* switch, not just self-service registration.
+# The CLI maps it straight to GOTRUE_EXTERNAL_EMAIL_ENABLED, so setting it
+# false turns off email/password logins entirely and every
+# sign_in_with_password call fails with "Email logins are disabled" —
+# including this application's own login flow, which is password-only.
+#
+# Open registration stays closed regardless: `enable_signup = false` under
+# [auth] above is a separate switch (GOTRUE_DISABLE_SIGNUP), and accounts
+# are still only ever created by an admin through the invitation flow.
+enable_signup = true
 enable_confirmations = false
 
 [auth.sms]

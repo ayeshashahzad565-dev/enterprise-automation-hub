@@ -42,14 +42,23 @@ def _insert_request(
 ) -> uuid.UUID:
     request_id = uuid.uuid4()
     cur.execute(
-        "insert into public.requests (id, requester_id, workflow_definition_id, request_type, title) "
-        "values (%s, %s, %s, %s, %s);",
+        # company_id is NOT NULL since the multi-tenancy conversion, and is
+        # read back off the requester's own profile rather than taken as a
+        # parameter: a request always belongs to its requester's company, so
+        # deriving it here keeps every call site unchanged and makes it
+        # impossible for a test to build a row whose tenant disagrees with
+        # the profile it points at.
+        "insert into public.requests "
+        "(id, requester_id, workflow_definition_id, request_type, title, company_id) "
+        "values (%s, %s, %s, %s, %s, "
+        "(select company_id from public.profiles where id = %s));",
         (
             str(request_id),
             str(requester_id),
             str(definition_id),
             "expense_reimbursement",
             "Test request",
+            str(requester_id),
         ),
     )
     return request_id
@@ -60,13 +69,18 @@ def _insert_definition(
 ) -> uuid.UUID:
     definition_id = uuid.uuid4()
     cur.execute(
-        "insert into public.workflow_definitions (id, request_type, version, definition, created_by) "
-        "values (%s, %s, %s, %s, %s);",
+        # company_id: derived from the author's profile, for the same reason
+        # as _insert_request above.
+        "insert into public.workflow_definitions "
+        "(id, request_type, version, definition, created_by, company_id) "
+        "values (%s, %s, %s, %s, %s, "
+        "(select company_id from public.profiles where id = %s));",
         (
             str(definition_id),
             request_type,
             version,
             psycopg.types.json.Json({"stages": []}),
+            str(created_by),
             str(created_by),
         ),
     )
@@ -80,14 +94,17 @@ class TestForeignKeyConstraints:
         )
         with pg_conn.cursor() as cur, pytest.raises(psycopg.errors.ForeignKeyViolation):
             cur.execute(
-                "insert into public.requests (id, requester_id, workflow_definition_id, request_type, title) "
-                "values (%s, %s, %s, %s, %s);",
+                "insert into public.requests "
+                "(id, requester_id, workflow_definition_id, request_type, title, company_id) "
+                "values (%s, %s, %s, %s, %s, "
+                "(select company_id from public.profiles where id = %s));",
                 (
                     str(uuid.uuid4()),
                     str(uuid.uuid4()),
                     str(definition_id),
                     "expense_reimbursement",
                     "Ghost requester",
+                    str(anchor_profile_id),
                 ),
             )
 
@@ -96,14 +113,17 @@ class TestForeignKeyConstraints:
     ):
         with pg_conn.cursor() as cur, pytest.raises(psycopg.errors.ForeignKeyViolation):
             cur.execute(
-                "insert into public.requests (id, requester_id, workflow_definition_id, request_type, title) "
-                "values (%s, %s, %s, %s, %s);",
+                "insert into public.requests "
+                "(id, requester_id, workflow_definition_id, request_type, title, company_id) "
+                "values (%s, %s, %s, %s, %s, "
+                "(select company_id from public.profiles where id = %s));",
                 (
                     str(uuid.uuid4()),
                     str(anchor_profile_id),
                     str(uuid.uuid4()),
                     "expense_reimbursement",
                     "Ghost definition",
+                    str(anchor_profile_id),
                 ),
             )
 
@@ -117,8 +137,11 @@ class TestForeignKeyConstraints:
         )
         stage_id = uuid.uuid4()
         cur.execute(
-            "insert into public.workflow_stages (id, request_id, stage_order, stage_name) values (%s, %s, %s, %s);",
-            (str(stage_id), str(request_id), 1, "Manager Review"),
+            "insert into public.workflow_stages "
+            "(id, request_id, stage_order, stage_name, company_id) "
+            "values (%s, %s, %s, %s, "
+            "(select company_id from public.requests where id = %s));",
+            (str(stage_id), str(request_id), 1, "Manager Review", str(request_id)),
         )
 
         cur.execute("delete from public.requests where id = %s;", (str(request_id),))
@@ -183,9 +206,18 @@ class TestProfileLifecycleForeignKeys:
         stage_id = uuid.uuid4()
         cur.execute(
             "insert into public.workflow_stages "
-            "(id, request_id, stage_order, stage_name, assigned_to, decided_by) "
-            "values (%s, %s, %s, %s, %s, %s);",
-            (str(stage_id), str(request_id), 1, "Manager Review", str(target.id), str(target.id)),
+            "(id, request_id, stage_order, stage_name, assigned_to, decided_by, company_id) "
+            "values (%s, %s, %s, %s, %s, %s, "
+            "(select company_id from public.requests where id = %s));",
+            (
+                str(stage_id),
+                str(request_id),
+                1,
+                "Manager Review",
+                str(target.id),
+                str(target.id),
+                str(request_id),
+            ),
         )
 
         cur.execute("delete from public.profiles where id = %s;", (str(target.id),))
@@ -254,14 +286,17 @@ class TestProfileLifecycleForeignKeys:
         cur = pg_conn.cursor()
         invitation_id = uuid.uuid4()
         cur.execute(
+            # company_id: derived from the inviter's profile, as above.
             "insert into public.user_invitations "
-            "(id, email, full_name, token_hash, invited_by, expires_at) "
-            "values (%s, %s, %s, %s, %s, now() + interval '1 day');",
+            "(id, email, full_name, token_hash, invited_by, expires_at, company_id) "
+            "values (%s, %s, %s, %s, %s, now() + interval '1 day', "
+            "(select company_id from public.profiles where id = %s));",
             (
                 str(invitation_id),
                 f"invitee-{invitation_id}@example.invalid",
                 "Invitee",
                 f"hash-{invitation_id}",
+                str(target.id),
                 str(target.id),
             ),
         )
@@ -312,15 +347,20 @@ class TestUniqueConstraints:
             cur, requester_id=anchor_profile_id, definition_id=definition_id
         )
         cur.execute(
-            "insert into public.workflow_stages (id, request_id, stage_order, stage_name) values (%s, %s, %s, %s);",
-            (str(uuid.uuid4()), str(request_id), 1, "Manager Review"),
+            "insert into public.workflow_stages "
+            "(id, request_id, stage_order, stage_name, company_id) "
+            "values (%s, %s, %s, %s, "
+            "(select company_id from public.requests where id = %s));",
+            (str(uuid.uuid4()), str(request_id), 1, "Manager Review", str(request_id)),
         )
 
         with pytest.raises(psycopg.errors.UniqueViolation):
             cur.execute(
-                "insert into public.workflow_stages (id, request_id, stage_order, stage_name) "
-                "values (%s, %s, %s, %s);",
-                (str(uuid.uuid4()), str(request_id), 1, "Duplicate Order"),
+                "insert into public.workflow_stages "
+                "(id, request_id, stage_order, stage_name, company_id) "
+                "values (%s, %s, %s, %s, "
+                "(select company_id from public.requests where id = %s));",
+                (str(uuid.uuid4()), str(request_id), 1, "Duplicate Order", str(request_id)),
             )
 
 
@@ -333,14 +373,17 @@ class TestCheckConstraints:
 
         with pytest.raises(psycopg.errors.CheckViolation):
             cur.execute(
-                "insert into public.requests (id, requester_id, workflow_definition_id, request_type, title) "
-                "values (%s, %s, %s, %s, %s);",
+                "insert into public.requests "
+                "(id, requester_id, workflow_definition_id, request_type, title, company_id) "
+                "values (%s, %s, %s, %s, %s, "
+                "(select company_id from public.profiles where id = %s));",
                 (
                     str(uuid.uuid4()),
                     str(anchor_profile_id),
                     str(definition_id),
                     "expense_reimbursement",
                     "x" * 201,
+                    str(anchor_profile_id),
                 ),
             )
 
@@ -355,9 +398,11 @@ class TestCheckConstraints:
 
         with pytest.raises(psycopg.errors.CheckViolation):
             cur.execute(
-                "insert into public.workflow_stages (id, request_id, stage_order, stage_name) "
-                "values (%s, %s, %s, %s);",
-                (str(uuid.uuid4()), str(request_id), 0, "Invalid Order"),
+                "insert into public.workflow_stages "
+                "(id, request_id, stage_order, stage_name, company_id) "
+                "values (%s, %s, %s, %s, "
+                "(select company_id from public.requests where id = %s));",
+                (str(uuid.uuid4()), str(request_id), 0, "Invalid Order", str(request_id)),
             )
 
     def test_a_comment_body_over_5000_characters_is_rejected(self, pg_conn, anchor_profile_id):
@@ -402,14 +447,17 @@ class TestTransactionsAndRollback:
 
         with pytest.raises(psycopg.errors.ForeignKeyViolation):
             cur.execute(
-                "insert into public.requests (id, requester_id, workflow_definition_id, request_type, title) "
-                "values (%s, %s, %s, %s, %s);",
+                "insert into public.requests "
+                "(id, requester_id, workflow_definition_id, request_type, title, company_id) "
+                "values (%s, %s, %s, %s, %s, "
+                "(select company_id from public.profiles where id = %s));",
                 (
                     str(uuid.uuid4()),
                     str(uuid.uuid4()),
                     str(uuid.uuid4()),
                     "expense_reimbursement",
                     "Broken",
+                    str(anchor_profile_id),
                 ),
             )
 
