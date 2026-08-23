@@ -5,7 +5,8 @@
 [![Next.js](https://img.shields.io/badge/UI-Next.js-000000.svg)](https://nextjs.org/)
 [![Supabase](https://img.shields.io/badge/backend-Supabase-3ECF8E.svg)](https://supabase.com/)
 [![Pydantic](https://img.shields.io/badge/validation-Pydantic%20v2-E92063.svg)](https://docs.pydantic.dev/latest/)
-[![Tests](https://img.shields.io/badge/tests-pytest-0A9EDC.svg)](https://docs.pytest.org/)
+[![E2E](https://github.com/ayeshashahzad565-dev/enterprise-automation-hub/actions/workflows/e2e.yml/badge.svg)](https://github.com/ayeshashahzad565-dev/enterprise-automation-hub/actions/workflows/e2e.yml)
+[![Tests](https://img.shields.io/badge/tests-pytest%20%7C%20vitest%20%7C%20playwright-0A9EDC.svg)](#running-tests)
 [![License: MIT](https://img.shields.io/badge/license-MIT-lightgrey.svg)](#license)
 [![Architecture](https://img.shields.io/badge/architecture-modular%20monolith-informational.svg)](#architecture-overview)
 
@@ -117,7 +118,7 @@ Full rationale for every layer, component, and design decision is documented in 
 | File Storage | Supabase Storage |
 | Background Jobs | APScheduler (in-process) |
 | Data Visualization | Recharts |
-| Testing | pytest (backend), vitest + ESLint + tsc (frontend) |
+| Testing | pytest (backend), Vitest (frontend unit/component), Playwright (browser end-to-end), ESLint + tsc |
 | Schema Migrations | Alembic |
 
 No message broker, container orchestration platform, distributed cache, or microservices architecture is used anywhere in this system — see the [Architecture Design Document](docs/architecture.md) for the full rationale behind keeping this a modular monolith.
@@ -145,14 +146,17 @@ frontend/
 ├── src/features/        # Feature-scoped hooks and components (analytics, requests, admin, ...)
 ├── src/components/      # Shared UI primitives and design-system patterns
 ├── src/services/        # Typed HTTP clients for the backend REST API
-└── src/types/           # Frontend-owned TypeScript types (independent of backend schemas)
+├── src/types/           # Frontend-owned TypeScript types (independent of backend schemas)
+└── e2e/                 # Playwright browser end-to-end suite (specs, fixtures, auth setup)
 
 tests/
 ├── unit/          # Fast, isolated tests — services, workflow engine, models, utils, API contracts
 ├── integration/   # Repository, Supabase, and scheduler tests against a real test database
 ├── security/      # RBAC, RLS, and injection-prevention tests
 ├── performance/   # Load, stress, and concurrency tests
-└── acceptance/    # End-to-end scenarios traced to the SRS
+└── acceptance/    # SRS-traced full-lifecycle scenarios through the real service
+                   #   and Workflow Engine classes, wired to in-memory fakes
+                   #   (browser end-to-end lives in frontend/e2e/)
 
 docs/              # Full architecture documentation set (see below)
 scripts/           # Database bootstrap, reset, and demo-data seed scripts
@@ -272,7 +276,25 @@ npm test
 npm run build
 ```
 
-Backend unit tests cover Application Services, the Workflow Engine, Domain models, utilities, and every API route's contract in isolation, using in-memory fake repositories — no network dependency. Integration, security, and performance tests require a migrated, disposable Supabase test project (`TEST_SUPABASE_URL`, `TEST_SUPABASE_SERVICE_ROLE_KEY`, `TEST_DATABASE_URL`) and are skipped when it isn't configured. The complete testing strategy — including transaction, concurrency, optimistic-locking, tenant-isolation, and RLS verification — is documented in the [Testing Strategy Document](docs/testing_strategy.md).
+The Playwright browser suite needs a real Supabase stack, because both the frontend (`supabase.auth.signInWithPassword`) and the backend (`SupabaseTokenVerifier`) delegate authentication to a real project — there is no local-JWT shortcut it can use instead. Bring up an ephemeral local stack, migrate and seed it, then run the suite:
+
+```bash
+# From the repository root: start, migrate, and seed the local Supabase stack
+supabase start
+alembic upgrade head
+python scripts/seed_e2e_fixtures.py
+
+# Frontend: browser end-to-end suite (first run only: install the browser)
+cd frontend
+npx playwright install --with-deps chromium
+npm run test:e2e        # or: npm run test:e2e:ui for the interactive runner
+```
+
+Once Supabase is up and seeded, `npm run test:e2e` is the only command needed: `playwright.config.ts` boots the two remaining dependencies itself — the FastAPI backend and a production Next.js build, not `next dev`, so the suite exercises the same artifact CI/CD actually ships. See [`frontend/e2e/README.md`](frontend/e2e/README.md) for the full local workflow.
+
+Backend unit tests cover Application Services, the Workflow Engine, Domain models, utilities, and every API route's contract in isolation, using in-memory fake repositories — no network dependency. Integration, security, and performance tests require a migrated, disposable Supabase test project (`TEST_SUPABASE_URL`, `TEST_SUPABASE_SERVICE_ROLE_KEY`, `TEST_DATABASE_URL`) and are skipped when it isn't configured. The Playwright suite in `frontend/e2e/` covers authentication, the dashboard, request submission, approvals, analytics, platform administration, session expiry, error handling, and cross-tenant isolation, driving a real browser against the assembled stack. The complete testing strategy — including transaction, concurrency, optimistic-locking, tenant-isolation, and RLS verification — is documented in the [Testing Strategy Document](docs/testing_strategy.md).
+
+Each suite runs in its own CI workflow: [`ci.yml`](.github/workflows/ci.yml) (lint, type checks, backend unit tests, frontend unit tests and build), [`integration.yml`](.github/workflows/integration.yml) (backend integration tests), and [`e2e.yml`](.github/workflows/e2e.yml) (the Playwright suite against an ephemeral Supabase stack, publishing an HTML report as a build artifact).
 
 ## Project Configuration
 
@@ -293,7 +315,7 @@ This repository's full architecture documentation lives in `/docs`. Each documen
 | [API Design](docs/api_design.md) | The full REST contract, resource schemas, error codes, rate limiting, and state transitions |
 | [Workflow Engine Design](docs/workflow_engine.md) | Workflow Engine internals, stage generation, assignment resolution, escalation, versioning |
 | [Approval Recovery Strategy](docs/approval_recovery_strategy.md) | Every write in the approval/rejection/escalation flow, its compensation (or why it has none), idempotency and retry-safety guarantees, and the one known race-window limitation |
-| [Testing Strategy](docs/testing_strategy.md) | Unit, integration, API, database, workflow, security, and performance testing strategy |
+| [Testing Strategy](docs/testing_strategy.md) | Unit, integration, API, database, workflow, security, performance, and browser end-to-end testing strategy, the CI workflow map, and the disclosed coverage gaps |
 | [Deployment Guide](docs/deployment.md) | Deployment topology, environment configuration, migrations, monitoring, backup, and recovery |
 | [Scheduler Distributed Coordination](docs/scheduler_distributed_coordination.md) | Redis-backed leader election and per-job distributed locking for multi-instance Scheduler deployments: the two lock primitives, automatic crash/failover recovery, and the one disclosed split-brain edge case |
 | [Docker Deployment Guide](docs/docker_deployment.md) | Command-level guide: building/running images and Compose stacks, migrations, the job system's background workers, Prometheus/Grafana, CD, troubleshooting |
@@ -323,7 +345,7 @@ Contributions are welcome. Before opening a pull request:
 1. Review the [Architecture Design Document](docs/architecture.md) — changes should preserve the existing layering and modular monolith design rather than introduce new infrastructure or patterns.
 2. Ensure new code is placed in the correct layer per [Repository Structure](#repository-structure); business logic belongs in `app/services` or `app/workflow`, never in `app/api` route handlers or the frontend.
 3. Add or update tests per the [Testing Strategy Document](docs/testing_strategy.md) — new behavior should be traceable to a specific test category, and every fixed defect should include a regression test.
-4. Run the full test suite locally (`pytest` for the backend, `npm run lint && npm run typecheck && npm test && npm run build` for the frontend) before submitting.
+4. Run the full test suite locally before submitting — `pytest` for the backend, `npm run lint && npm run typecheck && npm test && npm run build` for the frontend, and `npm run test:e2e` for the Playwright suite if your change touches a user-facing flow (see [Running Tests](#running-tests) for its Supabase prerequisites).
 5. Keep documentation in `/docs` consistent with any architectural change — this project treats its architecture documents as a source of truth, not after-the-fact description.
 
 ## License

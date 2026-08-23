@@ -1,20 +1,32 @@
 # Enterprise Automation Hub (EAH)
 ## Testing Strategy Document (TSD)
 
-**Version:** 1.0
+**Version:** 1.1
 **Status:** Finalized — consistent with the SRS, Architecture Design Document (ADD), Database Schema Design Document (DSD), API Design Document (API-ADD), and Workflow Engine Design Document (WEDD)
+**Revision 1.1:** Reconciled with the implemented test suites — module paths (`src/` → `app/`), the browser end-to-end suite (Sections 2.1–2.3, 13, 16), the parallel-workflow CI pipeline (Section 13), and three claims that no longer matched the code: the staging-based acceptance process (Section 16), the enforced coverage gate (Section 14), and the `tests/regression/` directory (Section 15)
 **Author:** Principal QA Architect
-**Testing Framework:** pytest (the project's sole test runner, per the fixed technology stack)
+**Testing Frameworks:** pytest (backend), Vitest + Testing Library (frontend unit/component), Playwright (browser end-to-end)
 
 > **Superseded note:** Written against the original Streamlit-based
 > Presentation Layer (`src/ui`), which has since been fully replaced by a
-> FastAPI backend (`app/`, tested with pytest exactly as described below)
-> plus a separate Next.js/React frontend (`frontend/`, tested with
-> Vitest + Testing Library — a second test runner this document predates).
-> The pyramid shape and per-layer coverage philosophy below still apply to
-> the backend; the frontend now has its own genuine automated test suite,
-> not just the "manual/exploratory only" Presentation Layer this document
-> describes.
+> FastAPI backend (`app/`, tested with pytest substantially as described
+> below) plus a separate Next.js/React frontend (`frontend/`). Three
+> corrections apply throughout, and the affected sections have been
+> updated in place rather than left to this note alone:
+>
+> 1. **Module paths.** Every `src/...` path below is now `app/...`
+>    (`src/workflows` → `app/workflow`, `src/repositories` →
+>    `app/database/repositories`, `src/ui` → the `frontend/` application).
+> 2. **The frontend is genuinely tested**, not "manual/exploratory only"
+>    as the original Presentation Layer section had it — Vitest +
+>    Testing Library cover components and pages, ESLint and `tsc` gate
+>    every change, and a Playwright suite drives a real browser.
+> 3. **Acceptance testing is automated in a browser** (Section 16), not
+>    against "Streamlit UI driven via automated interaction." It runs in
+>    CI on every commit against an ephemeral local Supabase stack, not
+>    on a nightly schedule against a long-lived staging project.
+>
+> The pyramid shape and per-layer coverage philosophy remain accurate.
 
 ---
 
@@ -80,13 +92,13 @@ This document introduces no table, endpoint, business rule, or technology not al
 
 ### 2.1 Test Pyramid
 
-EAH follows a conventional test pyramid, shaped by the ADD's layering: the majority of tests are fast, isolated unit tests against the Domain and Application layers; a smaller number of integration tests exercise the Repository Layer against a real Supabase/PostgreSQL instance; a still smaller number of end-to-end and acceptance tests exercise the full stack, per Section 16.
+EAH follows a conventional test pyramid, shaped by the ADD's layering: the majority of tests are fast, isolated unit tests against the Domain and Application layers; a smaller number of integration tests exercise the Repository Layer against a real Supabase/PostgreSQL instance; a still smaller number of browser end-to-end and acceptance tests exercise the full stack, per Section 16.
 
 ```mermaid
 flowchart TD
     subgraph Pyramid["EAH Test Pyramid"]
         direction TB
-        E2E["End-to-End / Acceptance Tests<br/>(Section 16)<br/>Fewest, slowest, highest confidence"]
+        E2E["Browser End-to-End / Acceptance Tests<br/>(Section 16, Playwright)<br/>Fewest, slowest, highest confidence"]
         API["API Tests<br/>(Section 5)<br/>Contract verification against API-ADD"]
         INT["Integration Tests<br/>(Section 4)<br/>Repository + Supabase + Scheduler"]
         UNIT["Unit Tests<br/>(Section 3)<br/>Services, Workflow Engine, Domain models<br/>Most numerous, fastest, run on every commit"]
@@ -94,52 +106,59 @@ flowchart TD
     UNIT --> INT --> API --> E2E
 ```
 
-The pyramid's shape is a direct consequence of the ADD's own design: because business logic lives in the Application and Domain layers, independent of Streamlit and largely independent of Supabase (per the ADD's Testability principle), the overwhelming majority of meaningful behavior — validation rules, workflow decisions, assignment resolution, error handling — can be verified without a database connection at all, which is what keeps the base of the pyramid both large and fast.
+The pyramid's shape is a direct consequence of the ADD's own design: because business logic lives in the Application and Domain layers, independent of the presentation layer and largely independent of Supabase (per the ADD's Testability principle), the overwhelming majority of meaningful behavior — validation rules, workflow decisions, assignment resolution, error handling — can be verified without a database connection at all, which is what keeps the base of the pyramid both large and fast.
 
 ### 2.2 Testing Layers
 
 | Layer | Corresponds To | Test Category |
 |---|---|---|
-| Presentation | `src/ui` | Manual/exploratory only (Section 17); not unit-tested directly, per the ADD's description of this layer as thin and delegation-only |
-| Application | `src/services` | Unit tests (Section 3.1), with repositories replaced by fakes |
-| Domain | `src/models` | Unit tests (Section 3.5), pure Pydantic v2 validation, no test doubles needed |
-| Workflow Engine | `src/workflows` | Unit tests (Section 3.2), pure functions, no I/O |
-| Repository | `src/repositories` | Integration tests (Section 4.1) against a real test-instance database |
+| Presentation | `frontend/src` | Vitest + Testing Library component/page tests, gated by ESLint and `tsc`; user-facing flows additionally covered by the Playwright suite (Section 16) |
+| Application | `app/services` | Unit tests (Section 3.1), with repositories replaced by fakes |
+| Domain | `app/models` | Unit tests (Section 3.5), pure Pydantic v2 validation, no test doubles needed |
+| Workflow Engine | `app/workflow` | Unit tests (Section 3.2), pure functions, no I/O |
+| Repository | `app/database/repositories` | Integration tests (Section 4.1) against a real test-instance database |
 | Database | Supabase PostgreSQL | Database tests (Section 6), directly exercising constraints, RLS, and transactions |
-| Scheduler | `src/scheduler` | Integration tests (Section 4.6) and failure tests (Section 10.3) |
+| Scheduler | `app/scheduler` | Integration tests (Section 4.6) and failure tests (Section 10.3) |
 | API Contract | Section 19 of the API-ADD | API tests (Section 5), exercised against the same Application Services layer per the API-ADD's Section 1.2 clarification that the REST contract is a specification over in-process calls today |
 
 ### 2.3 Test Organization
 
-Test code mirrors the source tree exactly, per the ADD's folder-responsibility discipline (ADD Section 6): a module at `src/services/request_service.py` is tested at `tests/services/test_request_service.py`; `src/workflows/` is tested at `tests/workflows/`; `src/repositories/` integration tests live at `tests/integration/repositories/`, kept in a distinct `integration/` subtree from unit tests so that a developer or CI stage can run the fast unit suite alone (`pytest tests/ --ignore=tests/integration`) without requiring a database connection.
+Backend test code mirrors the source tree, per the ADD's folder-responsibility discipline (ADD Section 6): a module at `app/services/request_service.py` is tested at `tests/unit/test_request_service.py`. Tests requiring a database are kept in a distinct `integration/` subtree so that a developer or CI stage can run the fast unit suite alone (`pytest -m "not integration"`) without provisioning one. Frontend tests are colocated with the code they cover — `page.tsx` is tested by `page.test.tsx` in the same directory, the prevailing Next.js convention — while the browser end-to-end suite, which belongs to no single component, sits in its own top-level `frontend/e2e/` tree.
 
 ```
-tests/
-├── unit/
-│   ├── services/          # mirrors src/services
-│   ├── workflows/         # mirrors src/workflows
-│   ├── models/            # mirrors src/models
-│   └── utils/             # mirrors src/utils
-├── integration/
-│   ├── repositories/      # mirrors src/repositories, real test DB
-│   ├── scheduler/         # APScheduler job integration
-│   └── database/          # constraints, RLS, transactions (Section 6)
-├── api/                   # contract tests against API-ADD Section 19
+tests/                     # Backend (pytest)
+├── unit/                  # Services, workflow engine, models, utils, API
+│                          #   contracts — in-memory fakes, no database
+├── integration/           # Repositories, Supabase, scheduler, database
+│                          #   constraints/RLS/transactions (Sections 4, 6)
 ├── security/              # RBAC, RLS, injection (Section 8)
 ├── performance/           # load/stress/concurrency (Section 9)
-└── acceptance/            # SRS-traced end-to-end scenarios (Section 16)
+├── acceptance/            # SRS-traced full-lifecycle scenarios through the
+│                          #   real service and Workflow Engine classes,
+│                          #   wired to in-memory fakes (Section 16)
+├── fixtures/              # Shared factories and test data (Section 11)
+└── conftest.py            # Shared pytest fixtures
+
+frontend/
+├── src/**/*.test.tsx      # Vitest + Testing Library, colocated with source
+└── e2e/                   # Playwright browser suite (Section 16)
+    ├── tests/             #   *.spec.ts — one file per user-facing flow
+    ├── fixtures/          #   auth helpers, seeded test users
+    └── setup/             #   authentication setup project
 ```
+
+Note that `tests/acceptance/` and `frontend/e2e/` are both "end-to-end" in the ordinary sense but differ in what they assemble: the former wires the real service and Workflow Engine classes to in-memory fakes and asserts on the resulting domain state, running in milliseconds with no infrastructure; the latter drives a real browser against a real backend, database, and auth provider. Both are retained deliberately — the first localizes a lifecycle regression to a specific service interaction, the second proves the assembled system actually works.
 
 ### 2.4 Test Environment
 
 | Environment | Purpose | Database |
 |---|---|---|
 | Local developer | Fast feedback during development | A local or ephemeral Supabase project (or a plain PostgreSQL instance matching the DSD's schema, for tests that do not require Supabase Auth/Storage specifically) |
-| CI | Automated verification on every commit/PR (Section 13) | A disposable, migration-applied test project, torn down after each run |
-| Staging | Pre-production acceptance and manual testing (Sections 16–17) | A dedicated Supabase project mirroring production configuration, seeded with representative test data (Section 11) |
+| CI | Automated verification on every commit/PR (Section 13) | An ephemeral local Supabase stack (`supabase start`), migrated with Alembic and seeded per run, torn down afterwards — no hosted project and no secrets are involved |
+| Staging | Pre-production manual and exploratory testing (Section 17) | A dedicated Supabase project mirroring production configuration, seeded with representative test data (Section 11). Acceptance testing (Section 16) no longer waits for this environment — it is automated and runs in CI |
 | Production | Live system | Not a test target for any automated suite in this document; production readiness is instead verified via the checklist in Section 18 |
 
-No environment in this table introduces infrastructure beyond Supabase and PostgreSQL, consistent with the ADD's and DSD's fixed technology constraint — "disposable test project" and "staging project" are configuration/deployment distinctions within Supabase, not additional infrastructure.
+No environment in this table introduces infrastructure beyond Supabase and PostgreSQL, consistent with the ADD's and DSD's fixed technology constraint — "ephemeral local stack" and "staging project" are configuration/deployment distinctions within Supabase, not additional infrastructure.
 
 ### 2.5 Test Architecture Diagram
 
@@ -148,14 +167,13 @@ flowchart TB
     subgraph Dev["Developer Workstation"]
         U1[pytest unit suite]
     end
-    subgraph CI["CI Pipeline (Section 13)"]
-        C1[pytest unit suite]
-        C2[pytest integration suite]
-        C3[pytest api suite]
-        C4[pytest security suite]
-        C5[Coverage gate]
+    subgraph CI["CI Workflows (Section 13, run in parallel)"]
+        C1["ci.yml<br/>lint, type check, pytest -m 'not integration',<br/>Vitest, Next.js build"]
+        C2["integration.yml<br/>pytest tests/integration"]
+        C3["e2e.yml<br/>Playwright browser suite"]
+        C4["security.yml<br/>dependency, secret, SAST, image scans"]
     end
-    subgraph TestDB["Disposable Test Supabase Project"]
+    subgraph TestDB["Ephemeral Supabase Stack (per workflow run)"]
         D1[(PostgreSQL, migrated via Alembic per DSD Section 15)]
     end
     subgraph Staging["Staging Environment"]
@@ -166,12 +184,14 @@ flowchart TB
     U1 -.local dev.-> D1
     C2 --> D1
     C3 --> D1
-    C4 --> D1
-    C1 --> C2 --> C3 --> C4 --> C5
-    C5 -->|pass| Staging
+    C1 --> G{All workflows green?}
+    C2 --> G
+    C3 --> G
+    C4 --> G
+    G -->|pass| Staging
     S1 --> S2
-    Staging --> Acceptance[Acceptance Testing, Section 16]
-    Acceptance --> Prod[Production Readiness Checklist, Section 18]
+    Staging --> Manual[Manual/Exploratory Verification, Section 17]
+    Manual --> Prod[Production Readiness Checklist, Section 18]
 ```
 
 ---
@@ -492,27 +512,40 @@ The governing rule: **a component is mocked only when the test's purpose is to v
 
 ### 13.1 Pipeline Stages
 
-The CI pipeline runs on every commit and pull request, executing the test categories in this document in strict order, fast-failing at the first stage that fails so that feedback on the cheapest, most common failure class (unit-level) arrives before any expensive stage runs.
+CI runs on every commit and pull request as **parallel GitHub Actions workflows**, rather than the single strictly-ordered chain this section originally specified. The ordering rationale in 13.2 still holds *within* each workflow — cheap checks first, fast-failing before expensive ones — but the workflows themselves run concurrently, because a slow browser suite blocking lint feedback costs developer time without catching anything earlier.
+
+| Workflow | Runs | Infrastructure |
+|---|---|---|
+| [`ci.yml`](../.github/workflows/ci.yml) | Lockfile-drift check, ruff, mypy, then `pytest -m "not integration"` — the unit, security, performance, and acceptance suites (Sections 3, 5, 8, 9, 16); ESLint, `tsc`, Vitest, production Next.js build | None — in-memory fakes only |
+| [`integration.yml`](../.github/workflows/integration.yml) | `pytest tests/integration` — repository, database, transaction, and RLS-policy suites (Sections 4, 6, 8.2) | Ephemeral local Supabase stack, Alembic-migrated |
+| [`e2e.yml`](../.github/workflows/e2e.yml) | Playwright browser suite (Section 16) | Ephemeral local Supabase stack, migrated and seeded; boots the backend and a production frontend build |
+| [`security.yml`](../.github/workflows/security.yml) | pip-audit, npm audit, Gitleaks secret scan, Bandit SAST, Trivy image scans | Builds both container images locally |
+| [`cd.yml`](../.github/workflows/cd.yml) | Image build and publish on merge to `main` | GHCR |
 
 ```mermaid
 flowchart LR
-    A[Commit / Pull Request] --> B[Lint + Type Check]
-    B --> C[Unit Tests<br/>Section 3]
-    C --> D[Coverage Gate<br/>Section 14]
-    D --> E[Provision Disposable Test Supabase Project<br/>Apply Alembic Migrations, DSD Section 15]
-    E --> F[Integration Tests<br/>Section 4]
-    F --> G[API Contract Tests<br/>Section 5]
-    G --> H[Database Tests<br/>Section 6]
-    H --> I[Workflow Tests<br/>Section 7]
-    I --> J[Security Tests<br/>Section 8]
-    J --> K{All Stages Passed?}
-    K -->|Yes| L[Tear Down Test Project<br/>Merge/Deploy Eligible]
-    K -->|No| M[Fail Pipeline<br/>Tear Down Test Project<br/>Report to Author]
+    A[Commit / Pull Request] --> B[ci.yml<br/>Lint, type check, unit suites, build]
+    A --> C[integration.yml<br/>Sections 4, 6, 8.2<br/>Ephemeral Supabase]
+    A --> D[e2e.yml<br/>Section 16, Playwright<br/>Ephemeral Supabase, seeded]
+    A --> E[security.yml<br/>Dependency, secret, SAST, image scans]
+    B --> F{All workflows passed?}
+    C --> F
+    D --> F
+    E --> F
+    F -->|Yes| G[Merge eligible → cd.yml publishes images]
+    F -->|No| H[Report failing workflow to author]
 ```
+
+The Playwright suite retries twice in CI (`retries: 2` in `playwright.config.ts`) and uploads an HTML report — including traces, screenshots, and video for failures — as a build artifact retained for 14 days, so a failure that does not reproduce locally remains diagnosable after the ephemeral stack is gone.
 
 ### 13.2 Stage Ordering Rationale
 
-Lint/type-check runs first because a type error is cheaper to catch than any test failure and would make every subsequent stage's results meaningless. Unit tests run before any database provisioning because they require none and catch the largest volume of defects per unit of CI time. Performance tests (Section 9) and full acceptance tests (Section 16) are deliberately **not** part of the per-commit pipeline above — they run on a separate, less frequent schedule (e.g., nightly or pre-release), since their cost (seeding large data volumes, sustained load generation) is disproportionate to running on every commit.
+Lint/type-check runs first because a type error is cheaper to catch than any test failure and would make every subsequent stage's results meaningless. Unit tests run before any database provisioning because they require none and catch the largest volume of defects per unit of CI time.
+
+This section originally excluded performance tests (Section 9) and acceptance tests (Section 16) from the per-commit pipeline, on the expectation that both would be too expensive to run on every commit. Both now run per-commit, for different reasons than the original assumption anticipated:
+
+- **Acceptance tests** are automated in a browser and run in their own workflow, so their cost is paid in parallel rather than in series. An ephemeral Supabase stack provisions in roughly the time the frontend build takes, which makes the "disproportionate on every commit" judgment no longer true.
+- **Performance tests** as implemented (`tests/performance/`, concurrency and optimistic-locking contention) run against in-memory fakes and complete in milliseconds. The sustained load generation and large-volume seeding this document envisioned — the actual justification for the nightly schedule — are still **not** implemented, and remain future work (Section 20).
 
 ### 13.3 Migration Verification in CI
 
@@ -524,40 +557,60 @@ Per the DSD's migration strategy (DSD Section 15), every CI run applies the full
 
 | Layer | Target Coverage | Rationale |
 |---|---|---|
-| Domain (`src/models`) | ≥ 95% | Pure validation logic with no external dependencies; nearly every branch is cheaply and deterministically testable, so a lower target would represent untested validation rules, not an acceptable gap |
-| Workflow Engine (`src/workflows`) | ≥ 95% | Pure functions, no I/O (WEDD Section 2.1); the same rationale as Domain applies directly |
-| Application Services (`src/services`) | ≥ 90% | Orchestration logic with mocked repositories; the small gap below 95% accommodates defensive branches for genuinely rare failure combinations that are also covered at the integration level |
-| Repositories (`src/repositories`) | ≥ 80% (unit) + full integration coverage of every public method | Repository logic is thin by design (ADD Section 6); the majority of confidence here comes from integration tests (Section 4.1), not unit-level line coverage |
-| Utilities (`src/utils`) | ≥ 90% | Small, isolated, and cheap to cover fully |
-| Presentation (`src/ui`) | Not coverage-gated | Deliberately thin and delegation-only per the ADD; verified through manual/exploratory testing (Section 17), not line coverage |
+| Domain (`app/models`) | ≥ 95% | Pure validation logic with no external dependencies; nearly every branch is cheaply and deterministically testable, so a lower target would represent untested validation rules, not an acceptable gap |
+| Workflow Engine (`app/workflow`) | ≥ 95% | Pure functions, no I/O (WEDD Section 2.1); the same rationale as Domain applies directly |
+| Application Services (`app/services`) | ≥ 90% | Orchestration logic with mocked repositories; the small gap below 95% accommodates defensive branches for genuinely rare failure combinations that are also covered at the integration level |
+| Repositories (`app/database/repositories`) | ≥ 80% (unit) + full integration coverage of every public method | Repository logic is thin by design (ADD Section 6); the majority of confidence here comes from integration tests (Section 4.1), not unit-level line coverage |
+| Utilities (`app/utils`) | ≥ 90% | Small, isolated, and cheap to cover fully |
+| Presentation (`frontend/src`) | Not coverage-gated | Covered by Vitest component tests and the Playwright suite (Section 16) against user-facing behavior, rather than by a line-coverage percentage |
 
-Coverage is a **diagnostic signal, not a goal in itself** — a change that increases coverage by testing an implementation detail unrelated to any documented guarantee (Section 1.3's core philosophy) is not a quality improvement. The coverage gate in the CI pipeline (Section 13.1) fails a build whose *aggregate* coverage across gated layers drops below its target, but coverage percentages are never used as the sole criterion for judging an individual pull request's test adequacy.
+Coverage is a **diagnostic signal, not a goal in itself** — a change that increases coverage by testing an implementation detail unrelated to any documented guarantee (Section 1.3's core philosophy) is not a quality improvement. Coverage percentages are never used as the sole criterion for judging an individual pull request's test adequacy.
+
+> **Implementation note:** the targets above are the standard this document sets, not a mechanically enforced gate. `pytest.ini` measures branch coverage on every run (`--cov=app --cov-branch`) and reports it, but **no `--cov-fail-under` threshold is configured**, so CI does not currently fail a build on a coverage regression — the per-layer figures are reviewed rather than enforced. Backend branch coverage stands at 79% aggregate across `app/` as of this revision. Wiring up an enforced threshold is tracked as future work (Section 20).
 
 ---
 
 ## 15. Regression Testing
 
-Every defect fixed in EAH is accompanied by a new test reproducing the original failure, added to the appropriate suite in this document's structure (Section 2.3) before the fix itself is committed — ensuring the defect cannot silently reappear. The full unit and integration suites (Sections 3–7) run on every commit (Section 13.1) and constitute the primary regression safety net; in addition, a dedicated, append-only `tests/regression/` directory holds tests tied to specific historical defects by reference (e.g., a comment linking to the original issue), kept distinct from ordinary feature tests so that the project's regression history remains individually traceable rather than dissolved anonymously into the general suite.
+Every defect fixed in EAH is accompanied by a new test reproducing the original failure, added to the appropriate suite in this document's structure (Section 2.3) before the fix itself is committed — ensuring the defect cannot silently reappear. The full unit and integration suites (Sections 3–7) run on every commit (Section 13.1) and constitute the primary regression safety net.
+
+> **Implementation note:** this section originally also specified a dedicated, append-only `tests/regression/` directory holding tests tied to historical defects by reference. **That directory does not exist.** In practice, regression tests have been placed alongside the feature tests for the behavior they cover, and traceability comes from the commit that introduces them (each fix commit carries its regression test) rather than from a separate tree. This is a deliberate divergence — colocating a regression test with its feature keeps the failure legible to whoever next edits that code — but it does mean the project's regression history is not separately enumerable, which is the property the original design was reaching for.
 
 ---
 
 ## 16. Acceptance Testing
 
-Acceptance tests are traced directly to the SRS's functional requirements, exercised end-to-end against a staging environment (Section 2.4) rather than a disposable CI test project, using the full stack exactly as a real user would encounter it (Streamlit UI driven via automated interaction, or, where UI automation is disproportionate, the equivalent Application Service call path documented in the API-ADD). Each acceptance scenario maps to one or more SRS requirements and one or more of the lifecycle steps already walked through concretely in the WEDD's own end-to-end example (WEDD Section-equivalent worked example referenced via the API-ADD's Section 31 end-to-end workflow) — submission, attachment, multi-stage approval, and completion — confirming the assembled system, not just its individual layers, satisfies the originally specified behavior.
+Acceptance testing is split across two suites with complementary strengths, both automated and both running on every commit (Section 13.1).
 
-| Acceptance Scenario | Traces To |
+**Browser end-to-end (`frontend/e2e/`, Playwright).** Drives a real Chromium browser against the assembled system — a production Next.js build, the FastAPI backend, and an ephemeral Supabase stack providing real authentication and a real Alembic-migrated database, seeded by `scripts/seed_e2e_fixtures.py`. Nothing is faked: a login in this suite is a genuine `signInWithPassword` against GoTrue, and a request submitted through the form is a real row behind real RLS policies. This is what verifies that the layers, each individually correct, are also correctly wired together.
+
+| Spec | Covers |
 |---|---|
-| An employee submits a request and it is correctly routed to the first configured stage | SRS functional requirement for request submission; WEDD Sections 4–5 |
-| A multi-department approval chain completes correctly across several distinct approvers | SRS functional requirement for configurable workflows; WEDD Section 7.5 |
-| A rejected request correctly halts further processing and notifies the requester with a reason | SRS functional requirement for rejection handling; WEDD Section 6.3, 6.6 |
-| An overdue approval is correctly escalated without manual intervention | SRS functional requirement for escalation; WEDD Section 8 |
-| An administrator activates a new workflow version without disrupting in-flight requests | SRS functional requirement for workflow configurability; WEDD Section 9.6 |
+| `auth.spec.ts` | Valid and invalid login, protected-route redirection while signed out, sign-out clearing the session |
+| `requests.spec.ts` | An employee submits a leave request through the real form |
+| `approvals.spec.ts` | An approver approves a pending request; an approver rejects one with a reason |
+| `dashboard.spec.ts` | Employee and approver dashboards render the KPIs and widgets appropriate to each role, and no others |
+| `analytics.spec.ts` | An employee is denied analytics data (backend 403 surfaced as an error state); an approver's panels resolve without a silent error |
+| `platform-admin.spec.ts` | A platform admin sees every seeded company; an ordinary company admin is denied Platform Administration entirely |
+| `tenant-isolation.spec.ts` | A Globex request is never visible to an Acme employee by direct URL, and a Globex pending stage never appears in an Acme approver's inbox |
+| `session-expiry.spec.ts` | A dead session redirects to `/login` on both a full reload and a client-side soft navigation |
+| `error-handling.spec.ts` | Unknown routes render the 404 page; missing form fields show inline errors; a backend 500 surfaces a retryable error state rather than a blank page |
+
+`tenant-isolation.spec.ts` deserves particular note: it verifies through the browser the same boundary that Section 8.2's RLS tests verify at the database level and the repository suite verifies in application code. Testing one guarantee independently at three layers is deliberate — the multi-tenancy boundary is the guarantee whose failure would be most severe, and a defect in any single layer alone should not be able to breach it.
+
+**Service-level lifecycle (`tests/acceptance/`, pytest).** Walks a complete two-stage approval lifecycle — user creation, workflow definition, submission, first-stage approval, second-stage approval, completion — through the real, unmodified service and Workflow Engine classes wired to in-memory fakes, asserting on the request record, workflow stages, audit log, and notifications at every step. It requires no infrastructure and runs in milliseconds, which is what lets it stay in the fast per-commit suite and localize a lifecycle regression to a specific service interaction rather than reporting only that a browser flow broke.
+
+Between them, these two suites cover the submission, multi-stage approval, rejection, and completion steps of the WEDD's worked end-to-end example.
+
+> **Known gap:** two scenarios this section originally specified are **not** covered by either suite today — *an overdue approval is escalated without manual intervention* (SRS escalation requirement; WEDD Section 8) and *an administrator activates a new workflow version without disrupting in-flight requests* (SRS workflow-configurability requirement; WEDD Section 9.6). Both behaviors are unit-tested (escalation in `tests/unit/`, version pinning in the Workflow Engine's versioning tests), but neither is exercised end-to-end. Escalation is awkward to drive from a browser because it is time-triggered rather than user-triggered; version activation is straightforwardly automatable and is the more valuable of the two to add next. Both are tracked in Section 20.
 
 ---
 
 ## 17. Manual Testing
 
-Manual and exploratory testing is scoped specifically to the Presentation Layer (`src/ui`), which is deliberately excluded from automated coverage targets (Section 14) because the ADD characterizes it as thin, delegation-only UI code whose correctness is best judged by direct human interaction — visual layout, Streamlit widget behavior, and usability — rather than by automated assertions against rendered HTML. A structured manual test checklist accompanies every release candidate, covering each Streamlit page named in the ADD's Component Breakdown (Requests, Approvals, Admin, Analytics, Login), confirming each correctly reflects the state already verified automatically at every layer beneath it.
+Manual and exploratory testing is scoped to what automated assertions genuinely cannot judge: visual layout and hierarchy, responsive behavior across viewport sizes, transition and loading-state feel, keyboard navigation and focus order, and overall usability. This is a narrower scope than this section originally defined — the frontend's *functional* correctness is no longer a manual concern, since Vitest covers component behavior and the Playwright suite (Section 16) covers user-facing flows end-to-end.
+
+A structured manual checklist accompanies every release candidate, covering each page group in the ADD's Component Breakdown (Requests, Approvals, Admin, Analytics, Login) and referencing the frontend interaction principles in [Design Philosophy](design_philosophy.md). Its purpose is to catch what a passing Playwright run cannot: a flow that works correctly but reads confusingly.
 
 ---
 
@@ -574,8 +627,8 @@ Manual and exploratory testing is scoped specifically to the Presentation Layer 
 | Scheduler | Escalation Check, Reminder Dispatch, and Nightly Analytics Aggregation jobs verified correct and within their scheduling interval at stated scale | Workflow and performance suites (Sections 7.3, 9.4) |
 | Performance | Latency targets (API-ADD Section 25.2) met at the DSD's stated scale under load and stress | Performance suite (Section 9) |
 | Security | RBAC, RLS, injection, authentication, and authorization suites all pass | Security suite (Section 8) |
-| Acceptance | Every scenario in Section 16 passes against staging | Acceptance testing |
-| Manual Verification | Presentation Layer checklist completed for the release candidate | Manual testing (Section 17) |
+| Acceptance | Every scenario in Section 16 passes — the Playwright suite green in `e2e.yml`, and the service-level lifecycle suite green in `ci.yml` | Acceptance testing |
+| Manual Verification | Presentation-layer checklist (layout, responsiveness, keyboard navigation, usability) completed for the release candidate | Manual testing (Section 17) |
 | Rollback Readiness | A rollback plan for the release (application version and, if applicable, associated migration) is documented and has itself been exercised in staging | Release process, cross-referencing DSD Section 15's forward-only philosophy and its stated expectation that a downgrade path is tested where one exists |
 
 A release is not eligible for production promotion until every row in this table is satisfied; no row is waived on the basis of schedule pressure, consistent with the ADD's stated priority of production readiness over expediency.
@@ -604,4 +657,10 @@ A release is not eligible for production promotion until every row in this table
 
 **Expanded escalation boundary testing.** As workflow definitions grow in number and complexity (WEDD Section 20's future evolution, particularly parallel approvals and conditional branching), the escalation and versioning test scenarios in Sections 7.3–7.4 should be expanded to cover those new stage-state possibilities as they are implemented, keeping this document's workflow-testing coverage aligned with the WEDD's own stated extensibility points rather than lagging behind them.
 
-None of the improvements above require introducing a testing tool beyond `pytest` and its standard ecosystem, consistent with the project's fixed technology stack; each is an expansion of rigor within the existing testing architecture (Section 2), not a departure from it.
+**Closing the two acceptance gaps (Section 16).** End-to-end coverage for workflow-version activation against in-flight requests, and for time-triggered escalation. The former is straightforwardly automatable in Playwright and is the higher-value of the two. The latter needs a way to advance or inject time — exposing a test-only trigger for the escalation job, so the browser suite can assert the resulting state transition without waiting out a real interval, is the likeliest approach.
+
+**An enforced coverage threshold (Section 14).** Adding `--cov-fail-under` to `pytest.ini` at, or just below, current aggregate branch coverage would convert this document's per-layer targets from a reviewed standard into a ratchet that prevents silent regression. The threshold should be set at the level actually held today and raised deliberately, rather than set aspirationally and immediately waived.
+
+**Genuine load and stress testing (Section 9).** The performance suite currently exercises concurrency and optimistic-locking contention against in-memory fakes. The sustained load generation and large-volume seeding this document specifies — verifying the API-ADD's latency targets at the DSD's stated scale — remain unimplemented, and are what Section 18's Performance row genuinely requires.
+
+Of the improvements above, only load testing would likely introduce a tool beyond the project's existing `pytest`/Vitest/Playwright stack; the rest are expansions of rigor within the existing testing architecture (Section 2), not departures from it.
