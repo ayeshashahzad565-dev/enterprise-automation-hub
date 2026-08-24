@@ -15,7 +15,10 @@ test("a dead session redirects to /login on the next protected navigation", asyn
   // request to a protected route; a session that can neither be trusted
   // nor refreshed must redirect to /login rather than rendering the page
   // (or, worse, a stale "still logged in" shell with failing API calls).
-  await page.goto("/requests");
+  // Tolerates net::ERR_ABORTED for the same reason as error-handling.spec's
+  // dead-session test: the middleware redirect can supersede this
+  // navigation mid-flight. The URL assertion is the real check.
+  await page.goto("/requests").catch(() => {});
   await expect(page).toHaveURL(/\/login$/);
 });
 

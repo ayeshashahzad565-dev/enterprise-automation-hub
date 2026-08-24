@@ -15,7 +15,10 @@ test("an employee can submit a new leave request", async ({ page }) => {
   await page.getByRole("button", { name: "Create request" }).click();
 
   await expect(page).toHaveURL(/\/requests\/[0-9a-f-]+$/);
-  await expect(page.getByText(title)).toBeVisible();
+  // By heading, not by text: the detail page renders the title twice —
+  // once in the breadcrumb trail and once as the PageTitle <h1> — so a
+  // plain text match resolves to both and fails strict mode.
+  await expect(page.getByRole("heading", { name: title })).toBeVisible();
   await expect(page.getByText("Pending", { exact: true })).toBeVisible();
 
   await page.goto("/requests");

@@ -18,8 +18,12 @@ test.describe("signed in", () => {
     await page.goto("/requests/new");
     await page.getByRole("button", { name: "Create request" }).click();
 
-    await expect(page.getByText("Select a request type")).toBeVisible();
-    await expect(page.getByText("Title is required")).toBeVisible();
+    // Target the field's own error node by id (request-form.tsx wires it
+    // through aria-describedby). "Select a request type" is also the
+    // Select's placeholder, so matching on text alone resolves to both the
+    // placeholder and the validation message.
+    await expect(page.locator("#request_type-error")).toHaveText("Select a request type");
+    await expect(page.locator("#title-error")).toHaveText("Title is required");
     await expect(page).toHaveURL(/\/requests\/new$/);
   });
 
@@ -50,7 +54,17 @@ test.describe("signed in", () => {
     await page.goto("/dashboard");
     await expect(page.getByText("Couldn't load your dashboard.")).toBeVisible();
 
-    await page.getByRole("button", { name: "Retry" }).click();
+    // Scope the click to the KPI row's own ErrorState. A failed
+    // dashboard-summary query renders several of the page's five
+    // ErrorStates at once, each with its own Retry button, so an unscoped
+    // getByRole resolves to more than one. The message <p> and the button
+    // are siblings inside one ErrorState container, so stepping up from
+    // the message picks exactly the right Retry.
+    await page
+      .getByText("Couldn't load your dashboard.")
+      .locator("..")
+      .getByRole("button", { name: "Retry" })
+      .click();
     // Exact: PageHeader's description contains "open requests", so the
     // loose form would report success without a KPI tile ever appearing.
     await expect(page.getByText("Open requests", { exact: true })).toBeVisible();
@@ -66,6 +80,11 @@ test("a dead session hitting a protected page redirects to /login instead of err
   // storageState the specs above depend on.
   await loginViaUi(page, ACME_SESSION_TESTER);
   await corruptSessionCookie(page);
-  await page.goto("/dashboard");
+  // A middleware redirect that lands while the navigation is still in
+  // flight surfaces as net::ERR_ABORTED: the navigation was superseded,
+  // not failed. That raced intermittently and made this test flaky. The
+  // URL assertion below is what actually decides the outcome, so an
+  // aborted goto is tolerated rather than thrown.
+  await page.goto("/dashboard").catch(() => {});
   await expect(page).toHaveURL(/\/login$/);
 });
