@@ -75,6 +75,17 @@ ACME = "Acme Corp"
 GLOBEX = "Globex Inc"
 
 ACME_EMPLOYEE_EMAIL = "e2e.acme.employee@example.invalid"
+#: Used only by the specs that deliberately destroy a session
+#: (``auth.spec.ts``'s logout, ``session-expiry.spec.ts``). The app signs
+#: out via ``supabase.auth.signOut()`` with no scope, and supabase-js
+#: defaults that to *global* — every refresh token for the user is
+#: revoked, and GoTrue drops the session row, so outstanding access tokens
+#: stop validating too. With ``fullyParallel`` those specs would otherwise
+#: revoke the very session the saved ``storageState`` files hold for
+#: ACME_EMPLOYEE, and any spec running concurrently would be bounced to
+#: /login mid-test. Giving them a persona nothing else authenticates as
+#: keeps that blast radius to themselves.
+ACME_SESSION_TESTER_EMAIL = "e2e.acme.session-tester@example.invalid"
 ACME_APPROVER_EMAIL = "e2e.acme.approver@example.invalid"
 ACME_ADMIN_EMAIL = "e2e.acme.admin@example.invalid"
 ACME_PLATFORM_ADMIN_EMAIL = "e2e.platform.admin@example.invalid"
@@ -313,6 +324,14 @@ def main() -> int:
         role=UserRole.EMPLOYEE,
         company_id=acme_id,
     )
+    _ensure_user(
+        client,
+        profile_repo,
+        email=ACME_SESSION_TESTER_EMAIL,
+        full_name="E2E Acme Session Tester",
+        role=UserRole.EMPLOYEE,
+        company_id=acme_id,
+    )
     acme_approver_id = _ensure_user(
         client,
         profile_repo,
@@ -377,6 +396,7 @@ def main() -> int:
     print("E2E fixtures ready. Every seeded persona shares one password.")
     print(f"  password: {PASSWORD}")
     print(f"  Acme employee:       {ACME_EMPLOYEE_EMAIL}")
+    print(f"  Acme session tester: {ACME_SESSION_TESTER_EMAIL}")
     print(f"  Acme approver:       {ACME_APPROVER_EMAIL}")
     print(f"  Acme admin:          {ACME_ADMIN_EMAIL}")
     print(f"  Platform admin:      {ACME_PLATFORM_ADMIN_EMAIL}")

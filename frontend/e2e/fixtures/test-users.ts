@@ -56,6 +56,27 @@ export const GLOBEX_APPROVER: TestUser = {
   company: "globex",
 };
 
+/**
+ * Reserved for the specs that exercise the session lifecycle itself
+ * (`auth.spec.ts`, `session-expiry.spec.ts`). Signing out through the UI
+ * calls `supabase.auth.signOut()` with no scope, which supabase-js treats
+ * as *global*: every refresh token for that user is revoked and GoTrue
+ * drops the session row, so even unexpired access tokens stop validating.
+ * Under `fullyParallel`, doing that as ACME_EMPLOYEE revoked the session
+ * held in the saved storageState files, and whichever specs were running
+ * at the time were redirected to /login part-way through.
+ *
+ * Deliberately absent from ALL_TEST_USERS: `auth.setup.ts` only needs to
+ * pre-authenticate the personas whose storageState other specs load, and
+ * these two specs always start from a signed-out context by design.
+ */
+export const ACME_SESSION_TESTER: TestUser = {
+  persona: "acme-session-tester",
+  email: "e2e.acme.session-tester@example.invalid",
+  password: PASSWORD,
+  company: "acme",
+};
+
 export const ALL_TEST_USERS: readonly TestUser[] = [
   ACME_EMPLOYEE,
   ACME_APPROVER,

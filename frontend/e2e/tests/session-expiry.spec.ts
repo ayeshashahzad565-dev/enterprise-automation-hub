@@ -1,13 +1,13 @@
 import { expect, test } from "@playwright/test";
 
 import { corruptSessionCookie, loginViaUi } from "../fixtures/auth-helpers";
-import { ACME_EMPLOYEE } from "../fixtures/test-users";
+import { ACME_SESSION_TESTER } from "../fixtures/test-users";
 
 // No stored storageState — starts from a real, freshly-established login
 // so the corrupted-cookie step below is the only deliberately broken part.
 
 test("a dead session redirects to /login on the next protected navigation", async ({ page }) => {
-  await loginViaUi(page, ACME_EMPLOYEE);
+  await loginViaUi(page, ACME_SESSION_TESTER);
 
   await corruptSessionCookie(page);
 
@@ -22,7 +22,7 @@ test("a dead session redirects to /login on the next protected navigation", asyn
 test("a dead session also redirects on a client-side (soft) navigation, not just a full reload", async ({
   page,
 }) => {
-  await loginViaUi(page, ACME_EMPLOYEE);
+  await loginViaUi(page, ACME_SESSION_TESTER);
   await page.goto("/dashboard");
   await expect(page.getByRole("heading", { name: /welcome back|dashboard/i })).toBeVisible();
 

@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 import { corruptSessionCookie, loginViaUi } from "../fixtures/auth-helpers";
-import { ACME_EMPLOYEE, authStateFile } from "../fixtures/test-users";
+import { ACME_EMPLOYEE, ACME_SESSION_TESTER, authStateFile } from "../fixtures/test-users";
 
 test.describe("signed in", () => {
   test.use({ storageState: authStateFile(ACME_EMPLOYEE) });
@@ -61,7 +61,10 @@ test.describe("signed in", () => {
 test("a dead session hitting a protected page redirects to /login instead of erroring silently", async ({
   page,
 }) => {
-  await loginViaUi(page, ACME_EMPLOYEE);
+  // The session-lifecycle persona, not ACME_EMPLOYEE: this test signs in
+  // for real and then breaks that session, so it stays clear of the
+  // storageState the specs above depend on.
+  await loginViaUi(page, ACME_SESSION_TESTER);
   await corruptSessionCookie(page);
   await page.goto("/dashboard");
   await expect(page).toHaveURL(/\/login$/);
