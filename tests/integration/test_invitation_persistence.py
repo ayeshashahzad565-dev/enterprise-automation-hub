@@ -479,8 +479,15 @@ class TestRowLevelSecurity:
             )
 
             cur.execute("set local role authenticated;")
+            # set_config(..., is_local => true) rather than
+            # `SET LOCAL request.jwt.claims = %s`: SET does not accept
+            # parameter placeholders, so psycopg's parameterised form fails
+            # with `syntax error at or near "$1"`. set_config is the
+            # function equivalent, takes the value as a real parameter (no
+            # string interpolation into SQL), and is likewise scoped to the
+            # surrounding transaction.
             cur.execute(
-                "set local request.jwt.claims = %s;",
+                "select set_config('request.jwt.claims', %s, true);",
                 (f'{{"sub": "{employee.id}"}}',),
             )
             cur.execute(
@@ -509,7 +516,7 @@ class TestRowLevelSecurity:
 
             cur.execute("set local role authenticated;")
             cur.execute(
-                "set local request.jwt.claims = %s;",
+                "select set_config('request.jwt.claims', %s, true);",
                 (f'{{"sub": "{admin.id}"}}',),
             )
             cur.execute(
@@ -524,7 +531,7 @@ class TestRowLevelSecurity:
         with pg_conn.cursor() as cur:
             cur.execute("set local role authenticated;")
             cur.execute(
-                "set local request.jwt.claims = %s;",
+                "select set_config('request.jwt.claims', %s, true);",
                 (f'{{"sub": "{employee.id}"}}',),
             )
             # Postgres reports a row-level-security policy violation as
