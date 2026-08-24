@@ -396,7 +396,7 @@ def make_authenticated_user(
 
 
 @pytest.fixture(scope="session")
-def anchor_profile_id(supabase_service_client) -> uuid.UUID:
+def anchor_profile_id(supabase_service_client, test_company_id) -> Iterator[uuid.UUID]:
     """The id of a real, valid ``profiles`` row usable as an FK anchor by
     raw-SQL tests that need *some* valid profile id but do not care which
     one — created once per session (never inside an already-open
@@ -412,7 +412,19 @@ def anchor_profile_id(supabase_service_client) -> uuid.UUID:
             "email": email,
             "password": f"Itest!{unique}A1",
             "email_confirm": True,
-            "user_metadata": {"full_name": "Anchor Profile", "role": "admin"},
+            # company_id is mandatory, not decorative: handle_new_user()
+            # (migration 0011) provisions the profiles row from this
+            # metadata and reads company_id straight out of it, with no
+            # fallback, while profiles.company_id has been NOT NULL since
+            # 0010. Omitting it makes the trigger raise, which surfaces
+            # from GoTrue as an opaque 500 "Database error creating new
+            # user" — and because this fixture is session-scoped, that
+            # single failure errors every test that depends on it.
+            "user_metadata": {
+                "full_name": "Anchor Profile",
+                "role": "admin",
+                "company_id": str(test_company_id),
+            },
         }
     )
     user_id = uuid.UUID(str(response.user.id))
