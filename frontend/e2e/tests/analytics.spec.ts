@@ -28,7 +28,13 @@ test.describe("approver", () => {
     // states (executive-narrative-panel.tsx) is a solid proxy for "this
     // whole tab's queries succeeded," without depending on exact chart
     // markup for a chart-heavy page.
-    await expect(page.getByText("Executive summary")).toBeVisible();
+    // Role + exact name, not getByText: the page also renders an "AI
+    // executive summary" heading, and getByText's case-insensitive
+    // substring match resolved to both, failing strict mode before it
+    // could assert anything.
+    await expect(
+      page.getByRole("heading", { name: "Executive summary", exact: true }),
+    ).toBeVisible();
     await expect(page.getByRole("button", { name: "Retry" })).toHaveCount(0);
   });
 });

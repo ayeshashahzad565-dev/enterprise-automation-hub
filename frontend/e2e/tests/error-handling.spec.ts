@@ -26,10 +26,17 @@ test.describe("signed in", () => {
   test("a backend 500 surfaces an error state with a working retry, not a blank page", async ({
     page,
   }) => {
-    let failNext = true;
+    // Two, not one: createQueryClient sets `retry: 1`, so a failed query
+    // is automatically retried once before it is ever reported as an
+    // error. Failing a single request meant that retry reached the real
+    // backend, succeeded, and the error state this test exists to check
+    // never rendered. Failing both attempts lets the query settle as an
+    // error; everything after — including the manual Retry click below —
+    // then passes through to the real endpoint.
+    let failuresRemaining = 2;
     await page.route("**/api/v1/dashboard-summary*", async (route) => {
-      if (failNext) {
-        failNext = false;
+      if (failuresRemaining > 0) {
+        failuresRemaining -= 1;
         await route.fulfill({
           status: 500,
           contentType: "application/json",
@@ -44,7 +51,9 @@ test.describe("signed in", () => {
     await expect(page.getByText("Couldn't load your dashboard.")).toBeVisible();
 
     await page.getByRole("button", { name: "Retry" }).click();
-    await expect(page.getByText("Open requests")).toBeVisible();
+    // Exact: PageHeader's description contains "open requests", so the
+    // loose form would report success without a KPI tile ever appearing.
+    await expect(page.getByText("Open requests", { exact: true })).toBeVisible();
     await expect(page.getByText("Couldn't load your dashboard.")).not.toBeVisible();
   });
 });
